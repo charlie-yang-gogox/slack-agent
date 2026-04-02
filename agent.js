@@ -48,6 +48,8 @@ if (!process.env.DEV_SLACK_APP_TOKEN) throw new Error("DEV_SLACK_APP_TOKEN is re
 const queue = new PQueue({ concurrency: 1 });
 const recentTickets = new Map();
 const pendingApprovals = new Map();
+const activeProcesses = new Map(); // ticketId → { proc, threadTs, channelId }
+const cancelledTickets = new Set(); // ticketIds that were cancelled (to suppress error messages)
 
 // --- Helpers ---
 async function postThread(client, channelId, threadTs, text) {
@@ -85,16 +87,27 @@ function runAsync(cmd, args, opts = {}) {
     if (opts.input) proc.stdin.end(opts.input);
     proc.stdout.on("data", (d) => { stdout += d; process.stdout.write(d); });
     proc.stderr.on("data", (d) => { stderr += d; process.stderr.write(d); });
-    proc.on("error", reject);
+    proc.on("error", (err) => {
+      if (opts.ticketId) activeProcesses.delete(opts.ticketId);
+      reject(err);
+    });
     proc.on("close", (code) => {
+      if (opts.ticketId) activeProcesses.delete(opts.ticketId);
       if (code !== 0) {
         reject(new Error(`Command failed (exit ${code}): ${cmd} ${args.join(" ")}\n${(stderr || stdout).trim()}`));
       } else { resolve(stdout); }
     });
+    if (opts.ticketId) {
+      activeProcesses.set(opts.ticketId, { proc, threadTs: opts.threadTs, channelId: opts.channelId });
+    }
     if (opts.timeout) {
       setTimeout(() => { proc.kill(); reject(new Error(`Command timed out: ${cmd}`)); }, opts.timeout);
     }
   });
+}
+
+function stripMention(text) {
+  return (text || "").replace(/^\s*<@[A-Z0-9]+>\s*/i, "").trim();
 }
 
 function getLatestSessionId() {
@@ -151,6 +164,23 @@ async function fetchThreadContext(client, channelId, threadTs) {
   }
 }
 
+// --- Cancel handler ---
+async function handleCancel(ticketId, channelId, threadTs, client) {
+  const active = activeProcesses.get(ticketId);
+  if (!active) {
+    await postThread(client, channelId, threadTs, `No running job found for \`${ticketId}\`.`);
+    return;
+  }
+  active.proc.kill("SIGTERM");
+  cancelledTickets.add(ticketId);
+  activeProcesses.delete(ticketId);
+  recentTickets.delete(ticketId);
+  // Clean up pending approval using the thread_ts from the active process entry if available
+  const approvalThreadTs = active.threadTs || threadTs;
+  pendingApprovals.delete(approvalThreadTs);
+  await postThread(client, channelId, threadTs, `Cancelled \`${ticketId}\`.`);
+}
+
 // --- Shared worktree helper: create-or-reuse ---
 function ensureWorktree(ticketId) {
   const branch = `feat/${ticketId.toLowerCase()}`;
@@ -189,159 +219,183 @@ function ensureWorktree(ticketId) {
 }
 
 // ===================================================================
-// PM Agent — "prd CAF-123"
+// PM Agent — app_mention handler
 // ===================================================================
-pmApp.message(/^prd\s+([A-Z]+-\d+)$/i, async ({ message, client }) => {
-  const ticketId = message.text.replace(/^prd\s+/i, "").trim().toUpperCase();
-  const channelId = message.channel;
-  const threadTs = message.ts;
-  const requesterId = message.user;
-  try { await client.reactions.add({ channel: channelId, timestamp: threadTs, name: "memo" }); } catch (_) {}
-  await postThread(client, channelId, threadTs, `Generating PRD + OpenSpec artifacts for \`${ticketId}\`...`);
+pmApp.event("app_mention", async ({ event, client }) => {
+  const text = stripMention(event.text);
+  const channelId = event.channel;
+  const messageTs = event.ts;
+  const threadTs = event.thread_ts || event.ts;
+  const requesterId = event.user;
 
-  queue.add(async () => {
-    let worktreePath, branch;
-    try {
-      // Fetch ticket
-      run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+  const prdMatch = text.match(/^prd\s+([A-Z]+-\d+)$/i);
+  const cancelMatch = text.match(/^cancel\s+([A-Z]+-\d+)$/i);
+  const isUpdate = /^update$/i.test(text);
 
-      // Create or reuse worktree with feature branch
-      ({ worktreePath, branch } = ensureWorktree(ticketId));
+  if (prdMatch) {
+    const ticketId = prdMatch[1].toUpperCase();
+    try { await client.reactions.add({ channel: channelId, timestamp: messageTs, name: "memo" }); } catch (_) {}
+    await postThread(client, channelId, threadTs, `Generating PRD + OpenSpec artifacts for \`${ticketId}\`...`);
 
-      // Run /opsx:ff which creates openspec artifacts (proposal, design, specs, tasks)
-      await postThread(client, channelId, threadTs, `PM agent is working on \`${branch}\` (PRD + specs + tasks)...`);
-      run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "prd"], { env: { ...process.env } });
-      const prdPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-prd.txt`, "utf8");
-      await runAsync(
-        CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-prd`],
-        { input: prdPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS }
-      );
+    queue.add(async () => {
+      let worktreePath, branch;
+      try {
+        // Fetch ticket
+        run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
 
-      // Ensure artifacts are committed and pushed (safety net)
-      spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
-      spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
-      run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+        // Create or reuse worktree with feature branch
+        ({ worktreePath, branch } = ensureWorktree(ticketId));
 
-      // Read generated artifacts and post to Slack
-      const changesDir = path.join(worktreePath, "openspec", "changes");
-      if (fs.existsSync(changesDir)) {
-        const changeDirs = fs.readdirSync(changesDir)
-          .filter(d => d !== "archive" && fs.statSync(path.join(changesDir, d)).isDirectory());
-
-        for (const dir of changeDirs) {
-          const artifactDir = path.join(changesDir, dir);
-          const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
-          await postThread(client, channelId, threadTs, `*OpenSpec: \`${dir}\`*`);
-          for (const file of files) {
-            const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
-            const header = `📄 *${file}*`;
-            // Post in chunks
-            for (let i = 0; i < content.length; i += 3000) {
-              const chunk = i === 0 ? `${header}\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
-              await postThread(client, channelId, threadTs, chunk);
-            }
-          }
-        }
-      }
-
-      // Mention requester
-      await postThread(client, channelId, threadTs,
-        `<@${requesterId}> PRD + specs for \`${ticketId}\` ready!\n\n` +
-        `*Artifacts saved to:* \`${path.join("openspec", "changes")}\`\n\n` +
-        `*Next steps:*\n` +
-        `• Leave feedback + \`update\` — PM Bot revises the specs\n` +
-        `• \`dev ${ticketId}\` — Dev Agent starts implementation (skips artifact generation)\n` +
-        `• \`approve: <extra notes>\` after dev starts to add instructions`
-      );
-
-      const sessionId = getLatestSessionId();
-      if (sessionId) {
-        await postThread(client, channelId, threadTs,
-          `To continue locally:\n\`\`\`\ncd ${worktreePath}\nclaude --resume ${ticketId}-prd\n\`\`\``
+        // Run /opsx:ff which creates openspec artifacts (proposal, design, specs, tasks)
+        await postThread(client, channelId, threadTs, `PM agent is working on \`${branch}\` (PRD + specs + tasks)...`);
+        run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "prd"], { env: { ...process.env } });
+        const prdPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-prd.txt`, "utf8");
+        await runAsync(
+          CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-prd`],
+          { input: prdPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
         );
-      }
-    } catch (err) {
-      console.error(`[PRD ${ticketId}] failed:`, err.message);
-      await postThread(client, channelId, threadTs, `PRD generation failed: ${err.message}`);
-    }
-  });
-});
 
-// --- PM thread revision: "update" in a prd thread ---
-pmApp.message(/^update$/i, async ({ message, client }) => {
-  if (!message.thread_ts) return;
-  const channelId = message.channel;
-  const threadTs = message.thread_ts;
+        // Ensure artifacts are committed and pushed (safety net)
+        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
 
-  // Find the ticket ID from the parent thread
-  const threadContext = await fetchThreadContext(client, channelId, threadTs);
-  const ticketMatch = threadContext.match(/([A-Z]+-\d+)/);
-  if (!ticketMatch) {
-    await postThread(client, channelId, threadTs, "Couldn't find a ticket ID in this thread.");
-    return;
-  }
-  const ticketId = ticketMatch[1].toUpperCase();
+        // Read generated artifacts and post to Slack
+        const changesDir = path.join(worktreePath, "openspec", "changes");
+        if (fs.existsSync(changesDir)) {
+          const changeDirs = fs.readdirSync(changesDir)
+            .filter(d => d !== "archive" && fs.statSync(path.join(changesDir, d)).isDirectory());
 
-  try { await client.reactions.add({ channel: channelId, timestamp: message.ts, name: "pencil2" }); } catch (_) {}
-  await postThread(client, channelId, threadTs, `Revising PRD for \`${ticketId}\` based on feedback...`);
-
-  queue.add(async () => {
-    try {
-      const fullThread = await fetchThreadContext(client, channelId, threadTs);
-
-      // Ensure worktree exists (reuse if PM already created it)
-      const { worktreePath, branch } = ensureWorktree(ticketId);
-      const workDir = worktreePath;
-
-      run("python3", [BUILD_PROMPT_PY, ticketId, workDir, "revise", fullThread], { env: { ...process.env } });
-      const revisePrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-revise.txt`, "utf8");
-
-      await runAsync(
-        CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-revise`],
-        { input: revisePrompt, cwd: workDir, env: { ...process.env, GIT_WORK_TREE: workDir }, timeout: CLAUDE_TIMEOUT_MS }
-      );
-
-      // Read updated artifacts and post to Slack
-      const changesDir = path.join(workDir, "openspec", "changes");
-      if (fs.existsSync(changesDir)) {
-        const changeDirs = fs.readdirSync(changesDir)
-          .filter(d => d !== "archive" && fs.statSync(path.join(changesDir, d)).isDirectory());
-        for (const dir of changeDirs) {
-          const artifactDir = path.join(changesDir, dir);
-          const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
-          await postThread(client, channelId, threadTs, `*Revised OpenSpec: \`${dir}\`*`);
-          for (const file of files) {
-            const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
-            for (let i = 0; i < content.length; i += 3000) {
-              const chunk = i === 0 ? `📄 *${file}*\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
-              await postThread(client, channelId, threadTs, chunk);
+          for (const dir of changeDirs) {
+            const artifactDir = path.join(changesDir, dir);
+            const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
+            await postThread(client, channelId, threadTs, `*OpenSpec: \`${dir}\`*`);
+            for (const file of files) {
+              const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
+              const header = `📄 *${file}*`;
+              // Post in chunks
+              for (let i = 0; i < content.length; i += 3000) {
+                const chunk = i === 0 ? `${header}\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
+                await postThread(client, channelId, threadTs, chunk);
+              }
             }
           }
         }
+
+        // Mention requester
+        await postThread(client, channelId, threadTs,
+          `<@${requesterId}> PRD + specs for \`${ticketId}\` ready!\n\n` +
+          `*Artifacts saved to:* \`${path.join("openspec", "changes")}\`\n\n` +
+          `*Next steps:*\n` +
+          `• Leave feedback + \`update\` — PM Bot revises the specs\n` +
+          `• \`dev ${ticketId}\` — Dev Agent starts implementation (skips artifact generation)\n` +
+          `• \`approve: <extra notes>\` after dev starts to add instructions`
+        );
+
+        const sessionId = getLatestSessionId();
+        if (sessionId) {
+          await postThread(client, channelId, threadTs,
+            `To continue locally:\n\`\`\`\ncd ${worktreePath}\nclaude --resume ${ticketId}-prd\n\`\`\``
+          );
+        }
+      } catch (err) {
+        if (cancelledTickets.has(ticketId)) {
+          console.log(`[PRD ${ticketId}] cancelled.`);
+          return;
+        }
+        console.error(`[PRD ${ticketId}] failed:`, err.message);
+        await postThread(client, channelId, threadTs, `PRD generation failed: ${err.message}`);
+      } finally {
+        cancelledTickets.delete(ticketId);
       }
+    });
 
-      // Commit and push revised artifacts
-      spawnSync("git", ["add", "-A"], { cwd: workDir, encoding: "utf8" });
-      spawnSync("git", ["commit", "-m", `chore: revise openspec artifacts for ${ticketId}`], { cwd: workDir, encoding: "utf8" });
-      spawnSync("git", ["push", "origin", branch], { cwd: workDir, encoding: "utf8" });
+  } else if (isUpdate) {
+    if (!event.thread_ts) return;
 
-      await postThread(client, channelId, threadTs,
-        `Specs revised and pushed to \`${branch}\`!\n` +
-        `• More feedback + \`update\` to revise again\n` +
-        `• \`dev ${ticketId}\` to start implementation`
-      );
-    } catch (err) {
-      console.error(`[PRD revise ${ticketId}] failed:`, err.message);
-      await postThread(client, channelId, threadTs, `Revision failed: ${err.message}`);
+    // Find the ticket ID from the parent thread
+    const threadContext = await fetchThreadContext(client, channelId, threadTs);
+    const ticketMatch = threadContext.match(/([A-Z]+-\d+)/);
+    if (!ticketMatch) {
+      await postThread(client, channelId, threadTs, "Couldn't find a ticket ID in this thread.");
+      return;
     }
-  });
+    const ticketId = ticketMatch[1].toUpperCase();
+
+    try { await client.reactions.add({ channel: channelId, timestamp: messageTs, name: "pencil2" }); } catch (_) {}
+    await postThread(client, channelId, threadTs, `Revising PRD for \`${ticketId}\` based on feedback...`);
+
+    queue.add(async () => {
+      try {
+        const fullThread = await fetchThreadContext(client, channelId, threadTs);
+
+        // Ensure worktree exists (reuse if PM already created it)
+        const { worktreePath, branch } = ensureWorktree(ticketId);
+        const workDir = worktreePath;
+
+        run("python3", [BUILD_PROMPT_PY, ticketId, workDir, "revise", fullThread], { env: { ...process.env } });
+        const revisePrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-revise.txt`, "utf8");
+
+        await runAsync(
+          CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-revise`],
+          { input: revisePrompt, cwd: workDir, env: { ...process.env, GIT_WORK_TREE: workDir }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
+        );
+
+        // Read updated artifacts and post to Slack
+        const changesDir = path.join(workDir, "openspec", "changes");
+        if (fs.existsSync(changesDir)) {
+          const changeDirs = fs.readdirSync(changesDir)
+            .filter(d => d !== "archive" && fs.statSync(path.join(changesDir, d)).isDirectory());
+          for (const dir of changeDirs) {
+            const artifactDir = path.join(changesDir, dir);
+            const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
+            await postThread(client, channelId, threadTs, `*Revised OpenSpec: \`${dir}\`*`);
+            for (const file of files) {
+              const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
+              for (let i = 0; i < content.length; i += 3000) {
+                const chunk = i === 0 ? `📄 *${file}*\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
+                await postThread(client, channelId, threadTs, chunk);
+              }
+            }
+          }
+        }
+
+        // Commit and push revised artifacts
+        spawnSync("git", ["add", "-A"], { cwd: workDir, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: revise openspec artifacts for ${ticketId}`], { cwd: workDir, encoding: "utf8" });
+        spawnSync("git", ["push", "origin", branch], { cwd: workDir, encoding: "utf8" });
+
+        await postThread(client, channelId, threadTs,
+          `Specs revised and pushed to \`${branch}\`!\n` +
+          `• More feedback + \`update\` to revise again\n` +
+          `• \`dev ${ticketId}\` to start implementation`
+        );
+      } catch (err) {
+        if (cancelledTickets.has(ticketId)) {
+          console.log(`[PRD revise ${ticketId}] cancelled.`);
+          return;
+        }
+        console.error(`[PRD revise ${ticketId}] failed:`, err.message);
+        await postThread(client, channelId, threadTs, `Revision failed: ${err.message}`);
+      } finally {
+        cancelledTickets.delete(ticketId);
+      }
+    });
+
+  } else if (cancelMatch) {
+    const ticketId = cancelMatch[1].toUpperCase();
+    await handleCancel(ticketId, channelId, threadTs, client);
+
+  } else {
+    // Unknown command — silently ignore or optionally send help
+  }
 });
 
 // ===================================================================
 // Dev Agent
 // ===================================================================
 
-// --- Approval handler ---
+// --- Approval handler (kept as message listener — thread replies, no mention needed) ---
 devApp.message(async ({ message, next }) => {
   if (!message.thread_ts) return await next();
   const pending = pendingApprovals.get(message.thread_ts);
@@ -360,39 +414,51 @@ devApp.message(async ({ message, next }) => {
   await next();
 });
 
-// --- "dev CAF-123" in a thread (inherits PM context) or "CAF-123" top-level ---
-devApp.message(/^(?:dev\s+)?([A-Z]+-\d+)$/i, async ({ message, client }) => {
-  const match = message.text.match(/^(?:dev\s+)?([A-Z]+-\d+)$/i);
-  if (!match) return;
-  const ticketId = match[1].toUpperCase();
-  const channelId = message.channel;
-  // If posted in a thread, use parent thread ts; otherwise use message ts
-  const threadTs = message.thread_ts || message.ts;
-  const isFromThread = !!message.thread_ts;
+// --- app_mention handler for dev commands ---
+devApp.event("app_mention", async ({ event, client }) => {
+  const text = stripMention(event.text);
+  const channelId = event.channel;
+  const messageTs = event.ts;
+  const threadTs = event.thread_ts || event.ts;
+  const isFromThread = !!event.thread_ts;
 
-  try { await client.reactions.add({ channel: channelId, timestamp: message.ts, name: "eyes" }); } catch (_) {}
+  const devMatch = text.match(/^(?:dev\s+)?([A-Z]+-\d+)$/i);
+  const cancelMatch = text.match(/^cancel\s+([A-Z]+-\d+)$/i);
 
-  if (isRecentlyQueued(ticketId)) {
-    await postThread(client, channelId, threadTs, `Already working on \`${ticketId}\`. Check the thread above.`);
-    return;
-  }
+  if (devMatch) {
+    const ticketId = devMatch[1].toUpperCase();
 
-  recentTickets.set(ticketId, Date.now());
+    try { await client.reactions.add({ channel: channelId, timestamp: messageTs, name: "eyes" }); } catch (_) {}
 
-  // Fetch thread context if triggered from an existing thread (e.g., PM thread)
-  let threadContext = "";
-  if (isFromThread) {
-    threadContext = await fetchThreadContext(client, channelId, threadTs);
-    await postThread(client, channelId, threadTs,
-      `Queued \`${ticketId}\` — incorporating thread context into development.`
-    );
+    if (isRecentlyQueued(ticketId)) {
+      await postThread(client, channelId, threadTs, `Already working on \`${ticketId}\`. Check the thread above.`);
+      return;
+    }
+
+    recentTickets.set(ticketId, Date.now());
+
+    // Fetch thread context if triggered from an existing thread (e.g., PM thread)
+    let threadContext = "";
+    if (isFromThread) {
+      threadContext = await fetchThreadContext(client, channelId, threadTs);
+      await postThread(client, channelId, threadTs,
+        `Queued \`${ticketId}\` — incorporating thread context into development.`
+      );
+    } else {
+      await postThread(client, channelId, threadTs,
+        `Queued \`${ticketId}\` — I'll update this thread as I go.`
+      );
+    }
+
+    queue.add(() => runDevJob(ticketId, channelId, threadTs, client, threadContext));
+
+  } else if (cancelMatch) {
+    const ticketId = cancelMatch[1].toUpperCase();
+    await handleCancel(ticketId, channelId, threadTs, client);
+
   } else {
-    await postThread(client, channelId, threadTs,
-      `Queued \`${ticketId}\` — I'll update this thread as I go.`
-    );
+    // Unknown command — silently ignore
   }
-
-  queue.add(() => runDevJob(ticketId, channelId, threadTs, client, threadContext));
 });
 
 // --- Main dev job runner ---
@@ -438,7 +504,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
 
       const ffOutput = await runAsync(
         CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--model", "opus", "--name", `${ticketId}-ff`],
-        { input: ffPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS }
+        { input: ffPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
       );
 
       if (jobTimedOut) throw new Error("Job timed out");
@@ -466,11 +532,12 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
         try {
           const out = await runAsync(
             CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--model", "opus", "--name", `${ticketId}-${label}`],
-            { input: prompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS }
+            { input: prompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
           );
           if (jobTimedOut) throw new Error("Job timed out");
           return out;
         } catch (err) {
+          if (cancelledTickets.has(ticketId)) throw err; // propagate immediately
           const isTransient = err.message.includes("500") || err.message.includes("Internal server error") || err.message.includes("529");
           if (isTransient && attempt <= retries) {
             const wait = attempt * 15000;
@@ -527,11 +594,16 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
       );
     }
   } catch (err) {
+    if (cancelledTickets.has(ticketId)) {
+      console.log(`[${ticketId}] Job cancelled.`);
+      return;
+    }
     console.error(`[${ticketId}] Job failed:`, err.message);
     await postThread(client, channelId, threadTs, `Failed on \`${ticketId}\`: ${err.message}\nWorktree preserved at \`${worktreePath}\` for debugging.`);
   } finally {
     clearTimeout(jobTimer);
     recentTickets.delete(ticketId);
+    cancelledTickets.delete(ticketId);
   }
 }
 
