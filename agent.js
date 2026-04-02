@@ -14,8 +14,8 @@ const FLUTTER_BIN = process.env.FLUTTER_BIN || "flutter";
 const REPO_ROOT = process.env.REPO_ROOT;
 if (!REPO_ROOT) throw new Error("REPO_ROOT is required (path to your flutter project)");
 const WORKTREE_BASE = process.env.WORKTREE_BASE || path.join(REPO_ROOT, ".claude", "worktree");
-const CLAUDE_TIMEOUT_MS = 28 * 60 * 1000;
-const JOB_TIMEOUT_MS = 30 * 60 * 1000;
+const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
+const JOB_TIMEOUT_MS = 60 * 60 * 1000;
 const DEDUP_TTL_MS = 10 * 60 * 1000;
 
 const FETCH_TICKET_PY = path.join(__dirname, "fetch_ticket.py");
@@ -31,18 +31,26 @@ const pmApp = new App({
   token: process.env.PM_SLACK_BOT_TOKEN,
   appToken: process.env.PM_SLACK_APP_TOKEN,
   socketMode: true,
+  clientOptions: { slackApiUrl: "https://slack.com/api/" },
+  socketModeOptions: { clientPingTimeout: 30000, serverPingTimeout: 30000 },
 });
 
 const devApp = new App({
   token: process.env.DEV_SLACK_BOT_TOKEN,
   appToken: process.env.DEV_SLACK_APP_TOKEN,
   socketMode: true,
+  clientOptions: { slackApiUrl: "https://slack.com/api/" },
+  socketModeOptions: { clientPingTimeout: 30000, serverPingTimeout: 30000 },
 });
 
 if (!process.env.PM_SLACK_BOT_TOKEN) throw new Error("PM_SLACK_BOT_TOKEN is required");
 if (!process.env.PM_SLACK_APP_TOKEN) throw new Error("PM_SLACK_APP_TOKEN is required");
 if (!process.env.DEV_SLACK_BOT_TOKEN) throw new Error("DEV_SLACK_BOT_TOKEN is required");
 if (!process.env.DEV_SLACK_APP_TOKEN) throw new Error("DEV_SLACK_APP_TOKEN is required");
+
+// --- Bot user IDs (resolved at startup) ---
+let pmBotUserId, devBotUserId;
+const startupTs = Date.now() / 1000; // Unix timestamp in seconds, for ignoring stale events
 
 // --- Shared state ---
 const queue = new PQueue({ concurrency: 1 });
@@ -51,6 +59,8 @@ const pendingApprovals = new Map();
 const activeProcesses = new Map(); // ticketId → { proc, threadTs, channelId }
 const cancelledTickets = new Set(); // ticketIds that were cancelled (to suppress error messages)
 const pendingConfirmations = new Map(); // threadTs → { resolve }
+const ffTickets = new Set(); // ticketIds currently in ff mode → skip approve + worktree confirm in dev
+const ffTicketExtras = new Map(); // ticketId → extra instructions string
 
 // --- Helpers ---
 async function postThread(client, channelId, threadTs, text) {
@@ -98,6 +108,13 @@ function runAsync(cmd, args, opts = {}) {
         reject(new Error(`Command failed (exit ${code}): ${cmd} ${args.join(" ")}\n${(stderr || stdout).trim()}`));
       } else { resolve(stdout); }
     });
+    // Heartbeat log every 2 minutes while process is running
+    const heartbeat = opts.ticketId ? setInterval(() => {
+      const elapsed = Math.round((Date.now() - heartbeatStart) / 1000);
+      console.log(`[${opts.ticketId}] still running... (${elapsed}s elapsed)`);
+    }, 2 * 60 * 1000) : null;
+    const heartbeatStart = Date.now();
+    proc.on("close", () => { if (heartbeat) clearInterval(heartbeat); });
     if (opts.ticketId) {
       activeProcesses.set(opts.ticketId, { proc, threadTs: opts.threadTs, channelId: opts.channelId });
     }
@@ -130,6 +147,15 @@ function cleanupWorktree(worktreePath) {
   } catch (_) {}
 }
 
+function safetyCommit(worktreePath, ticketId, label) {
+  spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+  const dirty = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: worktreePath, encoding: "utf8" }).status !== 0;
+  if (dirty) {
+    console.log(`[${ticketId}] Safety net (${label}): committing uncommitted changes`);
+    spawnSync("git", ["commit", "-m", `feat(${ticketId}): safety commit ${label}`], { cwd: worktreePath, encoding: "utf8" });
+  }
+}
+
 function isRecentlyQueued(ticketId) {
   const ts = recentTickets.get(ticketId);
   if (!ts) return false;
@@ -151,7 +177,7 @@ function waitForConfirmation(threadTs, timeoutMs = 5 * 60 * 1000) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingConfirmations.delete(threadTs);
-      resolve("reuse"); // default to reuse on timeout
+      resolve({ choice: "reuse", messageTs: null }); // default to reuse on timeout
     }, timeoutMs);
     pendingConfirmations.set(threadTs, { resolve: (val) => { clearTimeout(timer); resolve(val); } });
   });
@@ -176,7 +202,8 @@ async function fetchThreadContext(client, channelId, threadTs) {
 }
 
 // --- Cancel handler ---
-async function handleCancel(ticketId, channelId, threadTs, client) {
+async function handleCancel(ticketId, channelId, threadTs, messageTs, client) {
+  try { await client.reactions.add({ channel: channelId, timestamp: messageTs, name: "x" }); } catch (_) {}
   const active = activeProcesses.get(ticketId);
   if (!active) {
     await postThread(client, channelId, threadTs, `No running job found for \`${ticketId}\`.`);
@@ -192,7 +219,7 @@ async function handleCancel(ticketId, channelId, threadTs, client) {
 
   // Force-remove local worktree and branch
   const worktreePath = path.join(WORKTREE_BASE, ticketId);
-  const branch = `feat/${ticketId.toLowerCase()}`;
+  const branch = `feat/${ticketId}`;
   if (fs.existsSync(worktreePath)) {
     spawnSync("git", ["worktree", "remove", "--force", worktreePath], { cwd: REPO_ROOT, encoding: "utf8" });
   }
@@ -203,7 +230,7 @@ async function handleCancel(ticketId, channelId, threadTs, client) {
 
 // --- Shared worktree helper: create-or-reuse ---
 function ensureWorktree(ticketId) {
-  const branch = `feat/${ticketId.toLowerCase()}`;
+  const branch = `feat/${ticketId}`;
   const worktreePath = path.join(WORKTREE_BASE, ticketId);
   fs.mkdirSync(WORKTREE_BASE, { recursive: true });
   run("git", ["fetch", "origin"], { cwd: REPO_ROOT });
@@ -240,7 +267,7 @@ function ensureWorktree(ticketId) {
 
 // Interactive version: asks user if existing worktree should be recreated
 async function ensureWorktreeInteractive(ticketId, channelId, threadTs, client) {
-  const branch = `feat/${ticketId.toLowerCase()}`;
+  const branch = `feat/${ticketId}`;
   const worktreePath = path.join(WORKTREE_BASE, ticketId);
 
   if (fs.existsSync(worktreePath)) {
@@ -251,7 +278,10 @@ async function ensureWorktreeInteractive(ticketId, channelId, threadTs, client) 
         `Worktree for \`${ticketId}\` already exists on branch \`${branch}\`.\n` +
         `Reply \`recreate\` to delete and rebuild, or \`reuse\` to continue with existing.`
       );
-      const choice = await waitForConfirmation(threadTs);
+      const { choice, messageTs: confirmTs } = await waitForConfirmation(threadTs);
+      if (confirmTs) {
+        try { await client.reactions.add({ channel: channelId, timestamp: confirmTs, name: "white_check_mark" }); } catch (_) {}
+      }
       if (choice === "recreate") {
         await postThread(client, channelId, threadTs, `Deleting worktree and branch \`${branch}\`...`);
         spawnSync("git", ["worktree", "remove", "--force", worktreePath], { cwd: REPO_ROOT, encoding: "utf8" });
@@ -268,13 +298,13 @@ pmApp.message(async ({ message, next }) => {
   if (!message.thread_ts) return await next();
   const pending = pendingConfirmations.get(message.thread_ts);
   if (!pending) return await next();
-  const text = (message.text || "").trim().toLowerCase();
+  const text = stripMention(message.text).toLowerCase();
   if (text === "recreate") {
     pendingConfirmations.delete(message.thread_ts);
-    pending.resolve("recreate");
+    pending.resolve({ choice: "recreate", messageTs: message.ts });
   } else if (text === "reuse") {
     pendingConfirmations.delete(message.thread_ts);
-    pending.resolve("reuse");
+    pending.resolve({ choice: "reuse", messageTs: message.ts });
   }
   await next();
 });
@@ -283,6 +313,7 @@ pmApp.message(async ({ message, next }) => {
 // PM Agent — app_mention handler
 // ===================================================================
 pmApp.event("app_mention", async ({ event, client }) => {
+  if (parseFloat(event.ts) < startupTs) return; // ignore events from before startup
   const text = stripMention(event.text);
   const channelId = event.channel;
   const messageTs = event.ts;
@@ -290,6 +321,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
   const requesterId = event.user;
 
   const prdMatch = text.match(/^prd\s+([A-Z]+-\d+)$/i);
+  const ffMatch = text.match(/^ff\s+([A-Z]+-\d+)(?:\s*:\s*([\s\S]+))?$/i);
   const cancelMatch = text.match(/^cancel\s+([A-Z]+-\d+)$/i);
   const isUpdate = /^update$/i.test(text);
 
@@ -307,37 +339,49 @@ pmApp.event("app_mention", async ({ event, client }) => {
         // Create or reuse worktree with feature branch (asks user if exists)
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
-        // Run /opsx:ff which creates openspec artifacts (proposal, design, specs, tasks)
-        await postThread(client, channelId, threadTs, `PM agent is working on \`${branch}\` (PRD + specs + tasks)...`);
-        run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "prd"], { env: { ...process.env } });
-        const prdPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-prd.txt`, "utf8");
-        await runAsync(
-          CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-prd`],
-          { input: prdPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
-        );
-
-        // Ensure artifacts are committed and pushed (safety net)
-        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
-        spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
-        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
-
-        // Read generated artifacts and post to Slack
+        // Check if artifacts already exist
         const changesDir = path.join(worktreePath, "openspec", "changes");
-        if (fs.existsSync(changesDir)) {
-          const changeDirs = fs.readdirSync(changesDir)
-            .filter(d => d !== "archive" && fs.statSync(path.join(changesDir, d)).isDirectory());
+        const existingArtifacts = fs.existsSync(changesDir) && fs.readdirSync(changesDir)
+          .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
+        const hasArtifacts = existingArtifacts && existingArtifacts.length > 0;
 
-          for (const dir of changeDirs) {
-            const artifactDir = path.join(changesDir, dir);
-            const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
-            await postThread(client, channelId, threadTs, `*OpenSpec: \`${dir}\`*`);
-            for (const file of files) {
-              const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
-              const header = `📄 *${file}*`;
-              // Post in chunks
-              for (let i = 0; i < content.length; i += 3000) {
-                const chunk = i === 0 ? `${header}\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
-                await postThread(client, channelId, threadTs, chunk);
+        if (hasArtifacts) {
+          await postThread(client, channelId, threadTs,
+            `OpenSpec artifacts already exist: \`${existingArtifacts.join("`, `")}\`\nSkipping generation.`
+          );
+        } else {
+          // Run /opsx:ff which creates openspec artifacts (proposal, design, specs, tasks)
+          if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+          await postThread(client, channelId, threadTs, `PM agent is working on \`${branch}\` (PRD + specs + tasks)...`);
+          run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "prd"], { env: { ...process.env } });
+          if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+          const prdPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-prd.txt`, "utf8");
+          await runAsync(
+            CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-prd`],
+            { input: prdPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
+          );
+
+          // Ensure artifacts are committed and pushed (safety net)
+          spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+          spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+          run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+
+          // Read generated artifacts and post to Slack
+          if (fs.existsSync(changesDir)) {
+            const changeDirs = fs.readdirSync(changesDir)
+              .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
+
+            for (const dir of changeDirs) {
+              const artifactDir = path.join(changesDir, dir);
+              const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
+              await postThread(client, channelId, threadTs, `*OpenSpec: \`${dir}\`*`);
+              for (const file of files) {
+                const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
+                const header = `📄 *${file}*`;
+                for (let i = 0; i < content.length; i += 3000) {
+                  const chunk = i === 0 ? `${header}\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
+                  await postThread(client, channelId, threadTs, chunk);
+                }
               }
             }
           }
@@ -366,6 +410,94 @@ pmApp.event("app_mention", async ({ event, client }) => {
         }
         console.error(`[PRD ${ticketId}] failed:`, err.message);
         await postThread(client, channelId, threadTs, `PRD generation failed: ${err.message}`);
+      } finally {
+        cancelledTickets.delete(ticketId);
+      }
+    });
+
+  } else if (ffMatch) {
+    const ticketId = ffMatch[1].toUpperCase();
+    const extraInstructions = ffMatch[2] ? ffMatch[2].trim() : null;
+    try { await client.reactions.add({ channel: channelId, timestamp: messageTs, name: "rocket" }); } catch (_) {}
+    await postThread(client, channelId, threadTs, `FF mode: generating artifacts for \`${ticketId}\` then handing off to Dev...`);
+
+    queue.add(async () => {
+      let worktreePath, branch;
+      try {
+        // Fetch ticket
+        run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+
+        // Create or reuse worktree with feature branch (asks user if exists)
+        ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
+
+        // Check if artifacts already exist (e.g. from previous prd run)
+        const changesDir = path.join(worktreePath, "openspec", "changes");
+        const existingArtifacts = fs.existsSync(changesDir) && fs.readdirSync(changesDir)
+          .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
+        const hasArtifacts = existingArtifacts && existingArtifacts.length > 0;
+
+        if (hasArtifacts) {
+          await postThread(client, channelId, threadTs,
+            `OpenSpec artifacts already exist: \`${existingArtifacts.join("`, `")}\`\nSkipping PM agent, handing off to Dev directly.`
+          );
+        } else {
+          // Run PM agent (same as prd)
+          if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+          await postThread(client, channelId, threadTs, `PM agent is working on \`${branch}\` (PRD + specs + tasks)...`);
+          run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "prd"], { env: { ...process.env } });
+          if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+          const prdPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-prd.txt`, "utf8");
+          await runAsync(
+            CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-prd`],
+            { input: prdPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
+          );
+
+          // Ensure artifacts are committed and pushed
+          spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+          spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+          run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+
+          // Read generated artifacts and post to Slack
+          if (fs.existsSync(changesDir)) {
+            const changeDirs = fs.readdirSync(changesDir)
+              .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
+
+            for (const dir of changeDirs) {
+              const artifactDir = path.join(changesDir, dir);
+              const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
+              await postThread(client, channelId, threadTs, `*OpenSpec: \`${dir}\`*`);
+              for (const file of files) {
+                const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
+                const header = `📄 *${file}*`;
+                for (let i = 0; i < content.length; i += 3000) {
+                  const chunk = i === 0 ? `${header}\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
+                  await postThread(client, channelId, threadTs, chunk);
+                }
+              }
+            }
+          }
+        }
+
+        // Register ff state before triggering dev
+        ffTickets.add(ticketId);
+        if (extraInstructions) {
+          ffTicketExtras.set(ticketId, extraInstructions);
+        }
+
+        // Hand off to Dev Bot by posting a mention in the same thread
+        await postThread(client, channelId, threadTs, `<@${devBotUserId}> dev ${ticketId}`);
+
+      } catch (err) {
+        if (cancelledTickets.has(ticketId)) {
+          console.log(`[FF ${ticketId}] cancelled.`);
+          ffTickets.delete(ticketId);
+          ffTicketExtras.delete(ticketId);
+          return;
+        }
+        console.error(`[FF ${ticketId}] failed:`, err.message);
+        ffTickets.delete(ticketId);
+        ffTicketExtras.delete(ticketId);
+        await postThread(client, channelId, threadTs, `FF mode failed (PM phase): ${err.message}`);
       } finally {
         cancelledTickets.delete(ticketId);
       }
@@ -445,7 +577,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
 
   } else if (cancelMatch) {
     const ticketId = cancelMatch[1].toUpperCase();
-    await handleCancel(ticketId, channelId, threadTs, client);
+    await handleCancel(ticketId, channelId, threadTs, messageTs, client);
 
   } else {
     // Unknown command — silently ignore or optionally send help
@@ -461,13 +593,13 @@ devApp.message(async ({ message, next }) => {
   if (!message.thread_ts) return await next();
   const pending = pendingConfirmations.get(message.thread_ts);
   if (!pending) return await next();
-  const text = (message.text || "").trim().toLowerCase();
+  const text = stripMention(message.text).toLowerCase();
   if (text === "recreate") {
     pendingConfirmations.delete(message.thread_ts);
-    pending.resolve("recreate");
+    pending.resolve({ choice: "recreate", messageTs: message.ts });
   } else if (text === "reuse") {
     pendingConfirmations.delete(message.thread_ts);
-    pending.resolve("reuse");
+    pending.resolve({ choice: "reuse", messageTs: message.ts });
   }
   await next();
 });
@@ -477,7 +609,7 @@ devApp.message(async ({ message, next }) => {
   if (!message.thread_ts) return await next();
   const pending = pendingApprovals.get(message.thread_ts);
   if (!pending) return await next();
-  const text = (message.text || "").trim();
+  const text = stripMention(message.text);
   const approveMatch = text.match(/^approve[:\s]+([\s\S]+)/i) || (["approve","yes","ok","y"].includes(text.toLowerCase()) ? [null, ""] : null);
   const isReject = ["reject","no","cancel","n"].includes(text.toLowerCase());
 
@@ -493,6 +625,7 @@ devApp.message(async ({ message, next }) => {
 
 // --- app_mention handler for dev commands ---
 devApp.event("app_mention", async ({ event, client }) => {
+  if (parseFloat(event.ts) < startupTs) return; // ignore events from before startup
   const text = stripMention(event.text);
   const channelId = event.channel;
   const messageTs = event.ts;
@@ -527,11 +660,12 @@ devApp.event("app_mention", async ({ event, client }) => {
       );
     }
 
-    queue.add(() => runDevJob(ticketId, channelId, threadTs, client, threadContext));
+    const isFF = ffTickets.has(ticketId);
+    queue.add(() => runDevJob(ticketId, channelId, threadTs, client, threadContext, { isFF }));
 
   } else if (cancelMatch) {
     const ticketId = cancelMatch[1].toUpperCase();
-    await handleCancel(ticketId, channelId, threadTs, client);
+    await handleCancel(ticketId, channelId, threadTs, messageTs, client);
 
   } else {
     // Unknown command — silently ignore
@@ -539,7 +673,7 @@ devApp.event("app_mention", async ({ event, client }) => {
 });
 
 // --- Main dev job runner ---
-async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
+async function runDevJob(ticketId, channelId, threadTs, client, threadContext, opts = {}) {
   let jobTimedOut = false;
   const jobTimer = setTimeout(() => { jobTimedOut = true; }, JOB_TIMEOUT_MS);
 
@@ -547,15 +681,22 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
 
   try {
     // Step 1: Fetch ticket + Linear update
+    if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
     await postThread(client, channelId, threadTs, `Fetching ticket \`${ticketId}\`...`);
     run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
     run("python3", [LINEAR_UPDATE_PY, ticketId], { env: { ...process.env } });
 
+    if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
     if (jobTimedOut) throw new Error("Job timed out");
 
-    // Step 2: Create or reuse worktree with feature branch (asks user if exists)
+    // Step 2: Create or reuse worktree with feature branch
     await postThread(client, channelId, threadTs, `Preparing workspace...`);
-    ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
+    if (opts.isFF) {
+      // FF mode: PM already set up the worktree, skip interactive confirmation
+      ({ worktreePath, branch } = ensureWorktree(ticketId));
+    } else {
+      ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
+    }
 
     if (jobTimedOut) throw new Error("Job timed out");
 
@@ -571,7 +712,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
         `Skipping artifact generation.\nReply \`approve\` to start implementation, or \`reject\` to cancel.\nYou can also reply \`approve: <extra instructions>\`.`
       );
     } else {
-      await postThread(client, channelId, threadTs, `Generating artifacts (QA + Dev)...`);
+      await postThread(client, channelId, threadTs, `Generating artifacts...`);
       run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "ff"], { env: { ...process.env } });
       let ffPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-ff.txt`, "utf8");
 
@@ -592,31 +733,64 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
       );
     }
 
-    const { approved, extra } = await waitForApproval(threadTs);
-    if (!approved) {
-      await postThread(client, channelId, threadTs, `Cancelled \`${ticketId}\`.`);
-      return;
+    let approved, extra;
+    if (opts.isFF) {
+      // FF mode: auto-approve, no user interaction needed
+      approved = true;
+      extra = "";
+      // Read and consume ff extra instructions if any
+      const ffExtra = ffTicketExtras.get(ticketId);
+      if (ffExtra) {
+        extra = ffExtra;
+        ffTicketExtras.delete(ticketId);
+      }
+      await postThread(client, channelId, threadTs, `Auto-approved (ff mode), starting implementation...`);
+    } else {
+      ({ approved, extra } = await waitForApproval(threadTs));
+      if (!approved) {
+        await postThread(client, channelId, threadTs, `Cancelled \`${ticketId}\`.`);
+        return;
+      }
     }
 
     // Branch already exists from ensureWorktree — verify
     const currentBranch = run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktreePath }).trim();
     await postThread(client, channelId, threadTs, `Working on branch \`${currentBranch}\`...`);
 
-    // Skill runner with retry
+    // Skill runner with retry (transient errors) + resume on timeout
+    const MAX_RESUMES = 3;
     const runSkill = async (label, prompt, retries = 2) => {
       await postThread(client, channelId, threadTs, `Running \`${label}\`...`);
+      const sessionName = `${ticketId}-${label}`;
+      let isResume = false;
+
       for (let attempt = 1; attempt <= retries + 1; attempt++) {
         try {
+          const args = isResume
+            ? ["--print", "--dangerously-skip-permissions", "--model", "opus", "--resume", sessionName]
+            : ["--print", "--dangerously-skip-permissions", "--model", "opus", "--name", sessionName];
+          const input = isResume ? "Continue where you left off. Complete the remaining work." : prompt;
+
           const out = await runAsync(
-            CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--model", "opus", "--name", `${ticketId}-${label}`],
-            { input: prompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
+            CLAUDE_BIN, args,
+            { input, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
           );
           if (jobTimedOut) throw new Error("Job timed out");
           return out;
         } catch (err) {
-          if (cancelledTickets.has(ticketId)) throw err; // propagate immediately
+          if (cancelledTickets.has(ticketId)) throw err;
+
+          const isTimeout = err.message.includes("timed out");
           const isTransient = err.message.includes("500") || err.message.includes("Internal server error") || err.message.includes("529");
-          if (isTransient && attempt <= retries) {
+
+          if (isTimeout && attempt <= MAX_RESUMES) {
+            // Timeout: safety commit partial work, push, then resume session
+            safetyCommit(worktreePath, ticketId, `${label} timeout`);
+            try { run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath }); } catch (_) {}
+            await postThread(client, channelId, threadTs, `\`${label}\` timed out, resuming session... (attempt ${attempt}/${MAX_RESUMES})`);
+            isResume = true;
+            continue;
+          } else if (isTransient && attempt <= retries) {
             const wait = attempt * 15000;
             await postThread(client, channelId, threadTs, `\`${label}\` hit a transient API error, retrying in ${wait / 1000}s... (attempt ${attempt}/${retries})`);
             await new Promise(r => setTimeout(r, wait));
@@ -637,15 +811,38 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
     run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "apply", applyExtra], { env: { ...process.env } });
     const applyPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-apply.txt`, "utf8");
     await runSkill("opsx:apply", applyPrompt);
+    safetyCommit(worktreePath, ticketId, "after opsx:apply");
+    run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
     // Step 5: /commit
     await runSkill("commit", `/commit\n\nDo not ask for confirmation. Commit all changes automatically.\nIMPORTANT: You are working in a git worktree at ${worktreePath} on branch ${branch}. All git commands must run inside this directory. Do NOT commit to any other branch or directory.`);
+    safetyCommit(worktreePath, ticketId, "after /commit");
+    run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
     // Step 6: /format
     await runSkill("format", `/format\n\nDo not ask for confirmation. Format and commit automatically.\nIMPORTANT: You are working in a git worktree at ${worktreePath} on branch ${branch}. All git commands must run inside this directory.`);
+    safetyCommit(worktreePath, ticketId, "after /format");
+    run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
-    // Step 7: push all commits + create PR
+    // Step 7: archive openspec, commit any remaining changes, push + create PR
     await postThread(client, channelId, threadTs, `Pushing and creating PR...`);
+    const changesDir2 = path.join(worktreePath, "openspec", "changes");
+    const archiveDir = path.join(changesDir2, "archive");
+    if (fs.existsSync(changesDir2)) {
+      fs.mkdirSync(archiveDir, { recursive: true });
+      const toArchive = fs.readdirSync(changesDir2)
+        .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir2, d)).isDirectory());
+      for (const dir of toArchive) {
+        const src = path.join(changesDir2, dir);
+        const dst = path.join(archiveDir, dir);
+        spawnSync("mv", [src, dst], { cwd: worktreePath, encoding: "utf8" });
+      }
+    }
+    spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+    const hasStagedChanges = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: worktreePath, encoding: "utf8" }).status !== 0;
+    if (hasStagedChanges) {
+      spawnSync("git", ["commit", "-m", `chore: archive openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+    }
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
     run("python3", [path.join(worktreePath, CREATE_PR_PY_NAME)], { cwd: worktreePath, env: { ...process.env, TICKET_ID: ticketId } });
     if (jobTimedOut) throw new Error("Job timed out");
@@ -675,17 +872,42 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
       console.log(`[${ticketId}] Job cancelled.`);
       return;
     }
-    console.error(`[${ticketId}] Job failed:`, err.message);
-    await postThread(client, channelId, threadTs, `Failed on \`${ticketId}\`: ${err.message}\nWorktree preserved at \`${worktreePath}\` for debugging.`);
+    // Safety commit on failure — preserve any partial implementation
+    if (worktreePath && fs.existsSync(worktreePath)) {
+      safetyCommit(worktreePath, ticketId, "on failure");
+      // Push partial work so it's not lost
+      try {
+        run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
+        await postThread(client, channelId, threadTs,
+          `Failed on \`${ticketId}\`: ${err.message}\nPartial work committed and pushed to \`${branch}\`.\nWorktree preserved at \`${worktreePath}\` for debugging.`
+        );
+      } catch (_) {
+        await postThread(client, channelId, threadTs,
+          `Failed on \`${ticketId}\`: ${err.message}\nWorktree preserved at \`${worktreePath}\` for debugging.`
+        );
+      }
+    } else {
+      console.error(`[${ticketId}] Job failed:`, err.message);
+      await postThread(client, channelId, threadTs, `Failed on \`${ticketId}\`: ${err.message}`);
+    }
   } finally {
     clearTimeout(jobTimer);
     recentTickets.delete(ticketId);
     cancelledTickets.delete(ticketId);
+    ffTickets.delete(ticketId);
+    ffTicketExtras.delete(ticketId);
   }
 }
 
 // --- Start both bots ---
 (async () => {
+  const [pmAuth, devAuth] = await Promise.all([
+    pmApp.client.auth.test(),
+    devApp.client.auth.test(),
+  ]);
+  pmBotUserId = pmAuth.user_id;
+  devBotUserId = devAuth.user_id;
+
   await Promise.all([pmApp.start(), devApp.start()]);
   console.log("PM agent + Dev agent running (Socket Mode)");
 })();
