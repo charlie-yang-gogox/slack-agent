@@ -1,0 +1,8 @@
+#!/bin/bash
+# Shim: redirect "fvm flutter ..." to "flutter ..."
+if [ "$1" = "flutter" ]; then
+  shift
+  exec "${FLUTTER_BIN:-flutter}" "$@"
+else
+  exec "$@"
+fi
