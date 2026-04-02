@@ -50,6 +50,7 @@ const recentTickets = new Map();
 const pendingApprovals = new Map();
 const activeProcesses = new Map(); // ticketId → { proc, threadTs, channelId }
 const cancelledTickets = new Set(); // ticketIds that were cancelled (to suppress error messages)
+const pendingConfirmations = new Map(); // threadTs → { resolve }
 
 // --- Helpers ---
 async function postThread(client, channelId, threadTs, text) {
@@ -146,6 +147,16 @@ function waitForApproval(threadTs, timeoutMs = 60 * 60 * 1000) {
   });
 }
 
+function waitForConfirmation(threadTs, timeoutMs = 5 * 60 * 1000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingConfirmations.delete(threadTs);
+      resolve("reuse"); // default to reuse on timeout
+    }, timeoutMs);
+    pendingConfirmations.set(threadTs, { resolve: (val) => { clearTimeout(timer); resolve(val); } });
+  });
+}
+
 // Fetch all messages in a Slack thread to use as context
 async function fetchThreadContext(client, channelId, threadTs) {
   try {
@@ -178,7 +189,16 @@ async function handleCancel(ticketId, channelId, threadTs, client) {
   // Clean up pending approval using the thread_ts from the active process entry if available
   const approvalThreadTs = active.threadTs || threadTs;
   pendingApprovals.delete(approvalThreadTs);
-  await postThread(client, channelId, threadTs, `Cancelled \`${ticketId}\`.`);
+
+  // Force-remove local worktree and branch
+  const worktreePath = path.join(WORKTREE_BASE, ticketId);
+  const branch = `feat/${ticketId.toLowerCase()}`;
+  if (fs.existsSync(worktreePath)) {
+    spawnSync("git", ["worktree", "remove", "--force", worktreePath], { cwd: REPO_ROOT, encoding: "utf8" });
+  }
+  spawnSync("git", ["branch", "-D", branch], { cwd: REPO_ROOT, encoding: "utf8" });
+
+  await postThread(client, channelId, threadTs, `Cancelled \`${ticketId}\`. Worktree and branch \`${branch}\` removed.`);
 }
 
 // --- Shared worktree helper: create-or-reuse ---
@@ -218,6 +238,47 @@ function ensureWorktree(ticketId) {
   return { worktreePath, branch, created: true };
 }
 
+// Interactive version: asks user if existing worktree should be recreated
+async function ensureWorktreeInteractive(ticketId, channelId, threadTs, client) {
+  const branch = `feat/${ticketId.toLowerCase()}`;
+  const worktreePath = path.join(WORKTREE_BASE, ticketId);
+
+  if (fs.existsSync(worktreePath)) {
+    const head = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktreePath, encoding: "utf8" });
+    const currentBranch = (head.stdout || "").trim();
+    if (currentBranch === branch) {
+      await postThread(client, channelId, threadTs,
+        `Worktree for \`${ticketId}\` already exists on branch \`${branch}\`.\n` +
+        `Reply \`recreate\` to delete and rebuild, or \`reuse\` to continue with existing.`
+      );
+      const choice = await waitForConfirmation(threadTs);
+      if (choice === "recreate") {
+        await postThread(client, channelId, threadTs, `Deleting worktree and branch \`${branch}\`...`);
+        spawnSync("git", ["worktree", "remove", "--force", worktreePath], { cwd: REPO_ROOT, encoding: "utf8" });
+        spawnSync("git", ["branch", "-D", branch], { cwd: REPO_ROOT, encoding: "utf8" });
+      }
+    }
+  }
+
+  return ensureWorktree(ticketId);
+}
+
+// --- Confirmation handler for worktree recreate/reuse (PM) ---
+pmApp.message(async ({ message, next }) => {
+  if (!message.thread_ts) return await next();
+  const pending = pendingConfirmations.get(message.thread_ts);
+  if (!pending) return await next();
+  const text = (message.text || "").trim().toLowerCase();
+  if (text === "recreate") {
+    pendingConfirmations.delete(message.thread_ts);
+    pending.resolve("recreate");
+  } else if (text === "reuse") {
+    pendingConfirmations.delete(message.thread_ts);
+    pending.resolve("reuse");
+  }
+  await next();
+});
+
 // ===================================================================
 // PM Agent — app_mention handler
 // ===================================================================
@@ -243,8 +304,8 @@ pmApp.event("app_mention", async ({ event, client }) => {
         // Fetch ticket
         run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
 
-        // Create or reuse worktree with feature branch
-        ({ worktreePath, branch } = ensureWorktree(ticketId));
+        // Create or reuse worktree with feature branch (asks user if exists)
+        ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
         // Run /opsx:ff which creates openspec artifacts (proposal, design, specs, tasks)
         await postThread(client, channelId, threadTs, `PM agent is working on \`${branch}\` (PRD + specs + tasks)...`);
@@ -329,8 +390,8 @@ pmApp.event("app_mention", async ({ event, client }) => {
       try {
         const fullThread = await fetchThreadContext(client, channelId, threadTs);
 
-        // Ensure worktree exists (reuse if PM already created it)
-        const { worktreePath, branch } = ensureWorktree(ticketId);
+        // Ensure worktree exists (asks user if exists)
+        const { worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client);
         const workDir = worktreePath;
 
         run("python3", [BUILD_PROMPT_PY, ticketId, workDir, "revise", fullThread], { env: { ...process.env } });
@@ -394,6 +455,22 @@ pmApp.event("app_mention", async ({ event, client }) => {
 // ===================================================================
 // Dev Agent
 // ===================================================================
+
+// --- Confirmation handler for worktree recreate/reuse (Dev) ---
+devApp.message(async ({ message, next }) => {
+  if (!message.thread_ts) return await next();
+  const pending = pendingConfirmations.get(message.thread_ts);
+  if (!pending) return await next();
+  const text = (message.text || "").trim().toLowerCase();
+  if (text === "recreate") {
+    pendingConfirmations.delete(message.thread_ts);
+    pending.resolve("recreate");
+  } else if (text === "reuse") {
+    pendingConfirmations.delete(message.thread_ts);
+    pending.resolve("reuse");
+  }
+  await next();
+});
 
 // --- Approval handler (kept as message listener — thread replies, no mention needed) ---
 devApp.message(async ({ message, next }) => {
@@ -476,9 +553,9 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext) {
 
     if (jobTimedOut) throw new Error("Job timed out");
 
-    // Step 2: Create or reuse worktree with feature branch
+    // Step 2: Create or reuse worktree with feature branch (asks user if exists)
     await postThread(client, channelId, threadTs, `Preparing workspace...`);
-    ({ worktreePath, branch } = ensureWorktree(ticketId));
+    ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
     if (jobTimedOut) throw new Error("Job timed out");
 
