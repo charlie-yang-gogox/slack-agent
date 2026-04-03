@@ -147,6 +147,33 @@ function cleanupWorktree(worktreePath) {
   } catch (_) {}
 }
 
+// Clean agent output — strip permission error lines, keep real content
+function cleanAgentOutput(content) {
+  if (!content) return "";
+  const lines = content.split("\n");
+  const failurePatterns = [
+    "could you approve",
+    "seems to be restricted",
+    "asking for permission",
+    "i don't have access",
+    "i cannot write",
+    "unable to write",
+    "please approve",
+    "directory is protected",
+    "requires permission",
+  ];
+  const cleaned = lines.filter(line => {
+    const lower = line.toLowerCase();
+    return !failurePatterns.some(p => lower.includes(p));
+  }).join("\n").trim();
+  return cleaned;
+}
+
+function validateAgentOutput(content) {
+  const cleaned = cleanAgentOutput(content);
+  return cleaned.length >= 50;
+}
+
 function safetyCommit(worktreePath, ticketId, label) {
   spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
   const dirty = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: worktreePath, encoding: "utf8" }).status !== 0;
@@ -154,6 +181,161 @@ function safetyCommit(worktreePath, ticketId, label) {
     console.log(`[${ticketId}] Safety net (${label}): committing uncommitted changes`);
     spawnSync("git", ["commit", "-m", `feat(${ticketId}): safety commit ${label}`], { cwd: worktreePath, encoding: "utf8" });
   }
+}
+
+function buildTicketContext(ticketId, worktreePath, extraInstructions = "") {
+  const ticketPath = `/tmp/ticket-${ticketId}.json`;
+  const ticket = JSON.parse(fs.readFileSync(ticketPath, "utf8"));
+  const branch = `feat/${ticketId}`;
+  let context = `Ticket: ${ticketId} — ${ticket.title}\n`;
+  if (ticket.description) context += `\nDescription:\n${ticket.description}\n`;
+  context += `\nBranch: ${branch}\nWorktree: ${worktreePath}\n`;
+  if (extraInstructions) context += `\n## Additional instructions\n${extraInstructions}\n`;
+  return context;
+}
+
+// Check if openspec artifacts truly exist (dir with proposal.md = real artifacts from /opsx:ff)
+function checkArtifacts(changesDir) {
+  if (!fs.existsSync(changesDir)) return { hasArtifacts: false, dirs: [] };
+  const dirs = fs.readdirSync(changesDir)
+    .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory())
+    .filter(d => fs.existsSync(path.join(changesDir, d, "proposal.md")));
+  return { hasArtifacts: dirs.length > 0, dirs };
+}
+
+async function postArtifactsToSlack(changesDir, client, channelId, threadTs) {
+  const { dirs } = checkArtifacts(changesDir);
+  for (const dir of dirs) {
+    const artifactDir = path.join(changesDir, dir);
+    const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
+    await postThread(client, channelId, threadTs, `*OpenSpec: \`${dir}\`*`);
+    for (const file of files) {
+      const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
+      const header = `📄 *${file}*`;
+      for (let i = 0; i < content.length; i += 3000) {
+        const chunk = i === 0 ? `${header}\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
+        await postThread(client, channelId, threadTs, chunk);
+      }
+    }
+  }
+}
+
+function slugify(text) {
+  return text.toLowerCase().replace(/[^a-z0-9\s-]/g, "").replace(/[\s]+/g, "-").trim();
+}
+
+// Three-step PM phase: pm-agent + designer-agent (parallel, cached) → orchestrator /opsx:ff
+// Cache is managed by agent.js, not by Claude
+async function runPMPhase(ticketId, worktreePath, channelId, threadTs) {
+  const ticketContext = buildTicketContext(ticketId, worktreePath);
+  const ticketPath = `/tmp/ticket-${ticketId}.json`;
+  const ticket = JSON.parse(fs.readFileSync(ticketPath, "utf8"));
+  const titleSlug = slugify(ticket.title);
+  const cacheDir = path.join(worktreePath, "openspec", "changes", titleSlug);
+  const prdCache = path.join(cacheDir, "prd.md");
+  const designCache = path.join(cacheDir, "design-guidance.md");
+
+  fs.mkdirSync(cacheDir, { recursive: true });
+
+  // Step 1: Run pm-agent + designer-agent (skip if valid cache exists)
+  // Helper: run agent, validate output, write cache. Returns true if valid.
+  const runAndValidate = async (agentName, cachePath, sessionSuffix) => {
+    const output = await runAsync(
+      CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--agent", agentName, "--name", `${ticketId}-${sessionSuffix}`],
+      { input: `${ticketContext}\n\nSave output to: \`${cachePath}\``,
+        cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId: `${ticketId}:${sessionSuffix}` }
+    );
+    // Check if Claude wrote a valid file; fallback to cleaned stdout
+    const fileContent = fs.existsSync(cachePath) ? fs.readFileSync(cachePath, "utf8").trim() : "";
+    const rawOutput = output.trim();
+    console.log(`[${ticketId}] ${agentName}: file=${fileContent.length}chars, stdout=${rawOutput.length}chars`);
+    let content;
+    if (validateAgentOutput(fileContent)) {
+      content = cleanAgentOutput(fileContent);
+    } else {
+      content = cleanAgentOutput(rawOutput);
+    }
+    console.log(`[${ticketId}] ${agentName}: cleaned=${content.length}chars`);
+    if (!content || content.length < 10) {
+      console.error(`[${ticketId}] ${agentName} output failed validation (empty after cleaning)`);
+      return false;
+    }
+    // Always write cleaned content to ensure cache is valid
+    fs.writeFileSync(cachePath, content, "utf8");
+    console.log(`[${ticketId}] ${agentName} done → ${cachePath}`);
+    return true;
+  };
+
+  const isCacheValid = (cachePath) => {
+    if (!fs.existsSync(cachePath)) return false;
+    return validateAgentOutput(fs.readFileSync(cachePath, "utf8").trim());
+  };
+
+  const MAX_AGENT_RETRIES = 2;
+  const agents = [
+    { name: "pm-agent", cache: prdCache, suffix: "pm", label: "PRD" },
+    { name: "designer-agent", cache: designCache, suffix: "designer", label: "Design" },
+  ];
+
+  for (const agent of agents) {
+    if (isCacheValid(agent.cache)) {
+      console.log(`[${ticketId}] ${agent.label} cached and valid, skipping ${agent.name}`);
+      continue;
+    }
+    for (let attempt = 1; attempt <= MAX_AGENT_RETRIES; attempt++) {
+      console.log(`[${ticketId}] Spawning ${agent.name}... (attempt ${attempt}/${MAX_AGENT_RETRIES})`);
+      try {
+        const ok = await runAndValidate(agent.name, agent.cache, agent.suffix);
+        if (ok) break;
+      } catch (err) {
+        console.error(`[${ticketId}] ${agent.name} error: ${err.message}`);
+      }
+      if (attempt === MAX_AGENT_RETRIES) {
+        throw new Error(`${agent.name} failed validation after ${MAX_AGENT_RETRIES} attempts`);
+      }
+      // Delete invalid cache before retry
+      if (fs.existsSync(agent.cache)) fs.unlinkSync(agent.cache);
+    }
+  }
+
+  // Step 2: Read cached outputs
+  const prdContent = fs.readFileSync(prdCache, "utf8").trim();
+  const designContent = fs.readFileSync(designCache, "utf8").trim();
+
+  // Step 3: Orchestrator runs /opsx:ff with combined context
+  console.log(`[${ticketId}] Starting orchestrator (/opsx:ff)...`);
+  const orchestratorPrompt = `${ticketContext}
+
+## PRD (from PM agent)
+
+${prdContent}
+
+## Design Guidance (from Designer agent)
+
+${designContent}
+
+## Your task
+
+Run \`/opsx:ff ${titleSlug}\` — incorporate the PRD and design guidance above as context.
+
+This creates the OpenSpec artifacts: proposal.md, design.md, specs, and tasks.
+
+After \`/opsx:ff\` completes, output a summary listing:
+- Each artifact file created and a one-line description
+- All acceptance criteria (numbered)
+- Out-of-scope items
+
+Do NOT run \`/opsx:apply\`. Stop after artifacts are created.
+Stage and commit all changes before finishing.
+
+You have FULL write permissions to ALL directories including \`openspec/\`, \`lib/\`, and \`test/\`. Do NOT ask for permission — just execute tools directly. All permission checks are bypassed.
+`;
+
+  await runAsync(
+    CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--model", "opus", "--name", `${ticketId}-orchestrator`],
+    { input: orchestratorPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
+  );
+  console.log(`[${ticketId}] Orchestrator done.`);
 }
 
 function isRecentlyQueued(ticketId) {
@@ -323,7 +505,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
   const prdMatch = text.match(/^prd\s+([A-Z]+-\d+)$/i);
   const ffMatch = text.match(/^ff\s+([A-Z]+-\d+)(?:\s*:\s*([\s\S]+))?$/i);
   const cancelMatch = text.match(/^cancel\s+([A-Z]+-\d+)$/i);
-  const isUpdate = /^update$/i.test(text);
+  const isUpdate = /^update/i.test(text);
 
   if (prdMatch) {
     const ticketId = prdMatch[1].toUpperCase();
@@ -339,53 +521,27 @@ pmApp.event("app_mention", async ({ event, client }) => {
         // Create or reuse worktree with feature branch (asks user if exists)
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
-        // Check if artifacts already exist
+        // Check if artifacts already exist (must have proposal.md to be considered complete)
         const changesDir = path.join(worktreePath, "openspec", "changes");
-        const existingArtifacts = fs.existsSync(changesDir) && fs.readdirSync(changesDir)
-          .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
-        const hasArtifacts = existingArtifacts && existingArtifacts.length > 0;
+        const { hasArtifacts, dirs: existingArtifacts } = checkArtifacts(changesDir);
 
         if (hasArtifacts) {
           await postThread(client, channelId, threadTs,
             `OpenSpec artifacts already exist: \`${existingArtifacts.join("`, `")}\`\nSkipping generation.`
           );
         } else {
-          // Run /opsx:ff which creates openspec artifacts (proposal, design, specs, tasks)
           if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
-          await postThread(client, channelId, threadTs, `PM agent is working on \`${branch}\` (PRD + specs + tasks)...`);
-          run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "prd"], { env: { ...process.env } });
-          if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
-          const prdPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-prd.txt`, "utf8");
-          await runAsync(
-            CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-prd`],
-            { input: prdPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
-          );
+          await postThread(client, channelId, threadTs, `PM + Designer agents working on \`${branch}\`...`);
+          await runPMPhase(ticketId, worktreePath, channelId, threadTs);
 
           // Ensure artifacts are committed and pushed (safety net)
           spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
           spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
           run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
-
-          // Read generated artifacts and post to Slack
-          if (fs.existsSync(changesDir)) {
-            const changeDirs = fs.readdirSync(changesDir)
-              .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
-
-            for (const dir of changeDirs) {
-              const artifactDir = path.join(changesDir, dir);
-              const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
-              await postThread(client, channelId, threadTs, `*OpenSpec: \`${dir}\`*`);
-              for (const file of files) {
-                const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
-                const header = `📄 *${file}*`;
-                for (let i = 0; i < content.length; i += 3000) {
-                  const chunk = i === 0 ? `${header}\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
-                  await postThread(client, channelId, threadTs, chunk);
-                }
-              }
-            }
-          }
         }
+
+        // Post artifact contents to Slack (both skip and generate paths)
+        await postArtifactsToSlack(changesDir, client, channelId, threadTs);
 
         // Mention requester
         await postThread(client, channelId, threadTs,
@@ -430,53 +586,28 @@ pmApp.event("app_mention", async ({ event, client }) => {
         // Create or reuse worktree with feature branch (asks user if exists)
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
-        // Check if artifacts already exist (e.g. from previous prd run)
+        // Check if artifacts already exist (must have proposal.md to be considered complete)
         const changesDir = path.join(worktreePath, "openspec", "changes");
-        const existingArtifacts = fs.existsSync(changesDir) && fs.readdirSync(changesDir)
-          .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
-        const hasArtifacts = existingArtifacts && existingArtifacts.length > 0;
+        const { hasArtifacts, dirs: existingArtifacts } = checkArtifacts(changesDir);
 
         if (hasArtifacts) {
           await postThread(client, channelId, threadTs,
             `OpenSpec artifacts already exist: \`${existingArtifacts.join("`, `")}\`\nSkipping PM agent, handing off to Dev directly.`
           );
         } else {
-          // Run PM agent (same as prd)
+          // Run PM + Designer agents
           if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
-          await postThread(client, channelId, threadTs, `PM agent is working on \`${branch}\` (PRD + specs + tasks)...`);
-          run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "prd"], { env: { ...process.env } });
-          if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
-          const prdPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-prd.txt`, "utf8");
-          await runAsync(
-            CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-prd`],
-            { input: prdPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
-          );
+          await postThread(client, channelId, threadTs, `PM + Designer agents working on \`${branch}\`...`);
+          await runPMPhase(ticketId, worktreePath, channelId, threadTs);
 
           // Ensure artifacts are committed and pushed
           spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
           spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
           run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
-
-          // Read generated artifacts and post to Slack
-          if (fs.existsSync(changesDir)) {
-            const changeDirs = fs.readdirSync(changesDir)
-              .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
-
-            for (const dir of changeDirs) {
-              const artifactDir = path.join(changesDir, dir);
-              const files = fs.readdirSync(artifactDir).filter(f => f.endsWith(".md"));
-              await postThread(client, channelId, threadTs, `*OpenSpec: \`${dir}\`*`);
-              for (const file of files) {
-                const content = fs.readFileSync(path.join(artifactDir, file), "utf8").trim();
-                const header = `📄 *${file}*`;
-                for (let i = 0; i < content.length; i += 3000) {
-                  const chunk = i === 0 ? `${header}\n\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${content.slice(i, i + 3000)}\n\`\`\``;
-                  await postThread(client, channelId, threadTs, chunk);
-                }
-              }
-            }
-          }
         }
+
+        // Post artifact contents to Slack (both skip and generate paths)
+        await postArtifactsToSlack(changesDir, client, channelId, threadTs);
 
         // Register ff state before triggering dev
         ffTickets.add(ticketId);
@@ -522,8 +653,8 @@ pmApp.event("app_mention", async ({ event, client }) => {
       try {
         const fullThread = await fetchThreadContext(client, channelId, threadTs);
 
-        // Ensure worktree exists (asks user if exists)
-        const { worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client);
+        // Ensure worktree exists (reuse silently — update only revises existing artifacts)
+        const { worktreePath, branch } = ensureWorktree(ticketId);
         const workDir = worktreePath;
 
         run("python3", [BUILD_PROMPT_PY, ticketId, workDir, "revise", fullThread], { env: { ...process.env } });
@@ -661,7 +792,7 @@ devApp.event("app_mention", async ({ event, client }) => {
     }
 
     const isFF = ffTickets.has(ticketId);
-    queue.add(() => runDevJob(ticketId, channelId, threadTs, client, threadContext, { isFF }));
+    queue.add(() => runDevJob(ticketId, channelId, threadTs, client, threadContext, { isFF, isFromThread }));
 
   } else if (cancelMatch) {
     const ticketId = cancelMatch[1].toUpperCase();
@@ -691,8 +822,8 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
 
     // Step 2: Create or reuse worktree with feature branch
     await postThread(client, channelId, threadTs, `Preparing workspace...`);
-    if (opts.isFF) {
-      // FF mode: PM already set up the worktree, skip interactive confirmation
+    if (opts.isFF || opts.isFromThread) {
+      // FF mode or thread trigger: worktree already exists, skip interactive confirmation
       ({ worktreePath, branch } = ensureWorktree(ticketId));
     } else {
       ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
@@ -700,30 +831,20 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
 
     if (jobTimedOut) throw new Error("Job timed out");
 
-    // Step 3: Check if openspec artifacts already exist (e.g., from PM agent)
+    // Step 3: Check if openspec artifacts already exist (must have proposal.md)
     const changesDir = path.join(worktreePath, "openspec", "changes");
-    const hasArtifacts = fs.existsSync(changesDir) && fs.readdirSync(changesDir)
-      .filter(d => d !== "archive" && fs.statSync(path.join(changesDir, d)).isDirectory()).length > 0;
+    const { hasArtifacts, dirs: existing } = checkArtifacts(changesDir);
 
     if (hasArtifacts) {
-      const existing = fs.readdirSync(changesDir).filter(d => d !== "archive" && fs.statSync(path.join(changesDir, d)).isDirectory());
       await postThread(client, channelId, threadTs,
         `OpenSpec artifacts already exist: \`${existing.join("`, `")}\`\n` +
         `Skipping artifact generation.\nReply \`approve\` to start implementation, or \`reject\` to cancel.\nYou can also reply \`approve: <extra instructions>\`.`
       );
     } else {
-      await postThread(client, channelId, threadTs, `Generating artifacts...`);
-      run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "ff"], { env: { ...process.env } });
-      let ffPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-ff.txt`, "utf8");
+      await postThread(client, channelId, threadTs, `PM + Designer agents generating artifacts...`);
+      await runPMPhase(ticketId, worktreePath, channelId, threadTs);
 
-      if (threadContext) {
-        ffPrompt += `\n\n## Prior discussion and PRD from Slack thread\n\nThe following messages were posted in the Slack thread before this dev job started. Use them as context — they may contain a PRD, design feedback, or specific instructions from the reviewer.\n\n${threadContext}\n`;
-      }
-
-      const ffOutput = await runAsync(
-        CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--model", "opus", "--name", `${ticketId}-ff`],
-        { input: ffPrompt, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
-      );
+      const ffOutput = "(artifacts generated)";
 
       if (jobTimedOut) throw new Error("Job timed out");
 
@@ -760,15 +881,22 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     // Skill runner with retry (transient errors) + resume on timeout
     const MAX_RESUMES = 3;
     const runSkill = async (label, prompt, retries = 2) => {
+      console.log(`[${ticketId}] Starting ${label}...`);
       await postThread(client, channelId, threadTs, `Running \`${label}\`...`);
       const sessionName = `${ticketId}-${label}`;
+      const isAgent = ["pm-agent", "dev-agent"].includes(label);
       let isResume = false;
 
       for (let attempt = 1; attempt <= retries + 1; attempt++) {
         try {
-          const args = isResume
-            ? ["--print", "--dangerously-skip-permissions", "--model", "opus", "--resume", sessionName]
-            : ["--print", "--dangerously-skip-permissions", "--model", "opus", "--name", sessionName];
+          let args;
+          if (isResume) {
+            args = ["--print", "--dangerously-skip-permissions", "--model", "opus", "--resume", sessionName];
+          } else if (isAgent) {
+            args = ["--print", "--dangerously-skip-permissions", "--agent", label, "--name", sessionName];
+          } else {
+            args = ["--print", "--dangerously-skip-permissions", "--model", "opus", "--name", sessionName];
+          }
           const input = isResume ? "Continue where you left off. Complete the remaining work." : prompt;
 
           const out = await runAsync(
@@ -776,6 +904,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
             { input, cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
           );
           if (jobTimedOut) throw new Error("Job timed out");
+          console.log(`[${ticketId}] ${label} done.`);
           return out;
         } catch (err) {
           if (cancelledTickets.has(ticketId)) throw err;
@@ -807,10 +936,9 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
       applyExtra = `${applyExtra}\n\nSlack thread context:\n${threadContext}`;
     }
 
-    // Step 4b: /opsx:apply
-    run("python3", [BUILD_PROMPT_PY, ticketId, worktreePath, "apply", applyExtra], { env: { ...process.env } });
-    const applyPrompt = fs.readFileSync(`/tmp/agent-prompt-${ticketId}-apply.txt`, "utf8");
-    await runSkill("opsx:apply", applyPrompt);
+    // Step 4b: dev-agent (opsx:apply + verify + test)
+    const devContext = buildTicketContext(ticketId, worktreePath, applyExtra);
+    await runSkill("dev-agent", devContext);
     safetyCommit(worktreePath, ticketId, "after opsx:apply");
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
