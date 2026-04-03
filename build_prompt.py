@@ -29,7 +29,9 @@ CONSTRAINTS = """
 - If a tool call is needed, execute it immediately without asking
 """
 
-PREAMBLE = """You are a senior Flutter developer working on gogox-client-flutter.
+PROJECT_NAME = os.environ.get("PROJECT_NAME", "the target project")
+
+PREAMBLE = """You are a senior developer working on {project_name}.
 
 Ticket: {ticket_id} — {title}{description_section}
 
@@ -52,6 +54,7 @@ def build_prompt(ticket: dict, worktree_path: str, step: str = "ff", extra_instr
     )
 
     preamble = PREAMBLE.format(
+        project_name=PROJECT_NAME,
         ticket_id=ticket_id,
         title=title,
         description_section=description_section,

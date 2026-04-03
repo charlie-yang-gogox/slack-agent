@@ -8,66 +8,89 @@ A Slack-based auto development agent that orchestrates PM and Dev workflows via 
 - **Shared job queue** (`p-queue`, concurrency: 1)
 - **Claude Code CLI** (`--print --dangerously-skip-permissions`) for all AI work
 - **OpenSpec workflow** (`/opsx:ff`, `/opsx:apply`, `/opsx:verify`) for structured artifact-driven development
+- **Project-level Claude agents** (`pm-agent`, `designer-agent`, `dev-agent`) defined in target repo's `.claude/agents/`
+- **Orchestrator pattern**: Single opus session spawns PM + Designer as subagents, then runs `/opsx:ff`
 - **Git worktrees** (`.claude/worktree/{TICKET_ID}` under `REPO_ROOT`) for isolation — one worktree per ticket, shared between PM and Dev
 
 ## Slack Commands
 
 | Command | Bot | Action |
 |---|---|---|
-| `prd CAF-XXX` | PM | Generate PRD + OpenSpec artifacts (proposal, design, specs, tasks) |
-| `update` (in thread) | PM | Revise artifacts based on thread feedback |
-| `dev CAF-XXX` (in thread or top-level) | Dev | Start implementation using artifacts |
-| `CAF-XXX` (top-level) | Dev | Direct dev flow (generates artifacts if none exist) |
-| `approve` / `approve: <instructions>` | Dev | Start coding after artifact review |
-| `reject` | Dev | Cancel |
+| `@PM prd TICKET-ID` | PM | Generate PRD + OpenSpec artifacts |
+| `@PM ff TICKET-ID` | PM | Full auto: PRD → artifacts → hand off to Dev → PR |
+| `@PM ff TICKET-ID: <instructions>` | PM | FF with extra instructions for Dev |
+| `@PM update <feedback>` (in thread) | PM | Revise artifacts based on feedback |
+| `@PM cancel TICKET-ID` | PM | Kill running PM job |
+| `@Dev dev TICKET-ID` | Dev | Start implementation using artifacts |
+| `@Dev TICKET-ID` | Dev | Direct dev flow (generates artifacts if none exist) |
+| `@Dev cancel TICKET-ID` | Dev | Kill running Dev job |
+| `approve` / `approve: <instructions>` (in thread) | Dev | Start coding after artifact review |
+| `reject` (in thread) | Dev | Cancel |
+| `recreate` / `reuse` (in thread) | Both | Worktree conflict resolution |
 
 ## PM Agent Flow
 
 ```
-prd CAF-XXX
+@PM prd TICKET-ID
 → fetch Linear ticket
-→ ensureWorktree (creates feat/caf-xxx branch)
-→ PM + Designer subagents (sonnet) → /opsx:ff
+→ ensureWorktreeInteractive (asks recreate/reuse if exists)
+→ check existing artifacts (skip if proposal.md exists)
+→ orchestrator (opus) spawns pm-agent + designer-agent (sonnet, parallel)
+→ cache PRD + design guidance as prd.md / design-guidance.md
+→ orchestrator runs /opsx:ff with combined context
 → commit + push artifacts
 → post artifact files to Slack thread
 → @user "PRD ready!"
-→ [user feedback] → update → revise artifacts → commit + push
+→ [user feedback] → @PM update → revise artifacts → commit + push
+```
+
+## FF (Fast-Forward) Flow
+
+```
+@PM ff TICKET-ID
+→ same as prd flow above
+→ then: @Dev dev TICKET-ID (auto-triggered by PM)
+→ Dev auto-approves (no human input needed)
+→ Dev implements → commit → push → PR → code-review
+→ "All done! PR ready: <url>"
 ```
 
 ## Dev Agent Flow
 
 ```
-dev CAF-XXX (or CAF-XXX top-level)
+@Dev dev TICKET-ID
 → fetch ticket → Linear assign + In Progress
-→ ensureWorktree (reuses PM's worktree if exists)
-→ detect existing artifacts → skip ff / or generate new
-→ approve/reject
-→ /opsx:apply (opus model, writes code)
-→ /opsx:verify
-→ /commit → /format → git push → create_pr.py → /code-review
+→ ensureWorktree (reuses PM's worktree if in thread, asks if top-level)
+→ detect existing artifacts → skip generation / or run PM phase
+→ approve/reject (skipped in FF mode)
+→ dev-agent: /opsx:apply → /opsx:verify → flutter test → commit
+→ safetyCommit + push after each step (progressive push)
+→ /commit → /format → archive openspec → push → create_pr.py → /code-review
 → "All done! PR ready: <url>"
-→ "claude --resume {ticketId}-opsx:apply" for local continuation
 ```
 
 ## Key Design Decisions
 
+- **Orchestrator pattern**: Single opus session spawns pm-agent + designer-agent as subagents. Caches outputs in `openspec/changes/{slug}/prd.md` and `design-guidance.md`. Skips cached agents on retry.
+- **Project-level agents**: PM, Designer, Dev agent definitions live in the target repo's `.claude/agents/`, not in this orchestrator repo. Prompts travel with the project.
 - **ensureWorktree()**: Shared helper that creates or reuses worktree+branch. PM and Dev share the same worktree so artifacts persist.
-- **All work on worktree**: Never modifies REPO_ROOT directly. Each ticket gets `.claude/worktree/{TICKET_ID}` on `feat/{ticket_id}` branch.
-- **Worktree preserved on success and failure**: For debugging or local `claude --resume`.
-- **Named sessions**: Each Claude run gets `--name {ticketId}-{step}` for easy resume.
-- **Dev uses opus model**: For higher quality implementation.
-- **PM subagents use sonnet**: For faster PRD generation.
-- **Retry on API 500/529**: Up to 2 retries with backoff.
-- **fvm shim**: `bin/fvm` redirects `fvm flutter` → `flutter` since fvm isn't installed locally.
-- **Thread context**: When dev is triggered from a PM thread, all thread messages are injected into the prompt.
-- **Approve with instructions**: `approve: focus on error handling` appends to apply prompt.
-- **Main branch is `trunk`**: All branches are created from `origin/trunk`, PRs target `trunk`.
+- **ensureWorktreeInteractive()**: Asks `recreate`/`reuse` for prd/ff top-level. Skipped for `update`, thread triggers, and FF mode.
+- **All work on worktree**: Never modifies REPO_ROOT directly. Each ticket gets `.claude/worktree/{TICKET_ID}` on `feat/{TICKET_ID}` branch.
+- **Safety commits**: `safetyCommit()` after every Claude skill step. On failure, partial work is committed and pushed.
+- **Progressive push**: Push to remote after every step, not just at the end.
+- **Timeout auto-resume**: Claude CLI sessions auto-resume up to 3 times on timeout (45 min per attempt).
+- **Cancel**: Kills active process, removes local worktree + branch. Cancel-safe error handlers suppress misleading messages.
+- **Stale event filtering**: Events from before startup are ignored (`startupTs`).
+- **Socket keepalive**: `clientPingTimeout: 30000` prevents WebSocket idle disconnects.
+- **Artifact validation**: `checkArtifacts()` requires `proposal.md` to exist. `cleanAgentOutput()` strips permission errors. Stdout fallback if Write tool fails.
+- **Named sessions**: `{ticketId}-orchestrator`, `{ticketId}-pm`, `{ticketId}-designer`, `{ticketId}-dev-agent`, etc.
+- **Main branch**: Configurable via target repo. Default worktrees branch from `origin/trunk`.
 
 ## Files
 
 ```
-agent.js          — Main entry: two Slack apps, job queue, PM + Dev handlers
-build_prompt.py   — Generates Claude prompts for ff/prd/apply/revise steps
+agent.js          — Main entry: two Slack apps, job queue, PM + Dev handlers, orchestrator
+build_prompt.py   — Generates Claude prompts for ff/revise steps
 fetch_ticket.py   — Linear GraphQL → /tmp/ticket-{id}.json
 linear_update.py  — Assigns ticket to self + transitions to In Progress
 bin/fvm           — Shim: fvm flutter → flutter
@@ -78,16 +101,28 @@ bin/fvm           — Shim: fvm flutter → flutter
 
 ```bash
 cp .env.example .env
-# Fill in REPO_ROOT, Slack tokens, Linear API key
+# Fill in REPO_ROOT, Slack tokens, Linear API key, PROJECT_NAME
 npm install
 node agent.js
 ```
 
 ## Configuration (.env)
 
-- `REPO_ROOT` — path to the Flutter project this agent works on (required)
+- `REPO_ROOT` — path to the project repo this agent works on (required)
+- `PROJECT_NAME` — project name used in prompts (default: `the target project`)
 - `CLAUDE_BIN` — path to claude CLI (default: `claude`)
 - `FLUTTER_BIN` — path to flutter CLI (default: `flutter`)
 - `DEV_SLACK_BOT_TOKEN` / `DEV_SLACK_APP_TOKEN` — Dev Bot Slack app
 - `PM_SLACK_BOT_TOKEN` / `PM_SLACK_APP_TOKEN` — PM Bot Slack app
 - `LINEAR_API_KEY` — Linear API access
+
+## Target Repo Requirements
+
+The target repo (`REPO_ROOT`) should have these Claude Code agents defined:
+
+```
+.claude/agents/
+  pm-agent.md       — PRD generation (sonnet)
+  designer-agent.md — UX design guidance (sonnet)
+  dev-agent.md      — Implementation via /opsx:apply (opus)
+```
