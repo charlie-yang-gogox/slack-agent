@@ -33,30 +33,37 @@
   .metric { font-size: 24px; font-weight: 700; color: #f0f6fc; }
   .metric-label { font-size: 11px; color: #8b949e; margin-top: 2px; }
 
-  /* Current job */
-  .current-job { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
-  .job-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-  .ticket-id { font-size: 16px; font-weight: 700; color: #f0f6fc; }
+  /* Timeline task card */
+  .task-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 12px; }
+  .task-card.running { border-color: #d29922; }
+  .task-card.success { border-color: #3fb95066; }
+  .task-card.failed { border-color: #f8514966; }
+  .task-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .ticket-id { font-size: 15px; font-weight: 700; color: #f0f6fc; }
   .job-type { background: #1f6feb33; color: #58a6ff; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  .task-meta { font-size: 11px; color: #8b949e; }
+  .task-outcome { font-size: 12px; font-weight: 600; margin-top: 12px; padding: 8px 12px; border-radius: 4px; }
+  .task-outcome.success { background: #23863633; color: #3fb950; }
+  .task-outcome.failed { background: #f8514933; color: #f85149; }
+  .task-outcome.cancelled { background: #484f5833; color: #8b949e; }
 
-  .progress-steps { display: flex; gap: 3px; margin: 10px 0; }
-  .step { flex: 1; height: 4px; border-radius: 2px; background: #30363d; }
-  .step.done { background: #3fb950; }
-  .step.active { background: #d29922; }
-  .step-labels { display: flex; justify-content: space-between; font-size: 10px; color: #8b949e; }
-  .step-labels .active-label { color: #d29922; font-weight: 600; }
-
-  /* Error banner */
-  .error-banner { background: #f8514933; border: 1px solid #f85149; border-radius: 6px; padding: 10px 14px; margin-bottom: 12px; color: #f85149; font-size: 12px; display: none; }
-  .error-banner.visible { display: block; }
-
-  /* Log panel */
-  .log-panel { background: #010409; border: 1px solid #30363d; border-radius: 6px; padding: 12px; font-size: 12px; line-height: 1.6; max-height: 400px; overflow-y: auto; }
-  .log-line { white-space: pre-wrap; word-break: break-all; color: #8b949e; }
-  .log-line .ts { color: #484f58; }
-  .log-line .src-stdout { color: #58a6ff; }
-  .log-line .src-stderr { color: #d29922; }
-  .log-line .src-step { color: #3fb950; font-weight: 600; }
+  /* Vertical timeline */
+  .timeline { position: relative; padding-left: 24px; }
+  .timeline::before { content: ''; position: absolute; left: 7px; top: 4px; bottom: 4px; width: 2px; background: #30363d; }
+  .tl-item { position: relative; padding: 0 0 16px 16px; }
+  .tl-item:last-child { padding-bottom: 0; }
+  .tl-dot { position: absolute; left: -20px; top: 2px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #30363d; background: #0d1117; }
+  .tl-item.done .tl-dot { background: #3fb950; border-color: #3fb950; }
+  .tl-item.active .tl-dot { background: #d29922; border-color: #d29922; animation: pulse 1.5s infinite; }
+  .tl-item.error .tl-dot { background: #f85149; border-color: #f85149; }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 #d2992244; } 50% { box-shadow: 0 0 0 4px #d2992244; } }
+  .tl-name { font-size: 12px; color: #f0f6fc; font-weight: 500; }
+  .tl-item.pending .tl-name { color: #484f58; }
+  .tl-time { font-size: 11px; color: #8b949e; margin-top: 2px; }
+  .tl-duration { color: #58a6ff; font-size: 11px; margin-left: 8px; }
+  .tl-logs { margin-top: 6px; padding: 6px 8px; background: #010409; border-radius: 4px; font-size: 11px; color: #8b949e; max-height: 80px; overflow-y: auto; line-height: 1.5; }
+  .tl-logs .log-warn { color: #d29922; }
+  .tl-error-msg { margin-top: 4px; font-size: 11px; color: #f85149; }
 
   .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin: 14px 0 8px; }
 
@@ -132,27 +139,10 @@
       </div>
     </div>
 
-    <div class="error-banner" id="errorBanner"></div>
-
-    <div id="currentJobSection" style="display:none;">
-      <div class="current-job">
-        <div class="job-header">
-          <div>
-            <span class="ticket-id" id="jobTicketId"></span>
-            <span class="job-type" id="jobType"></span>
-          </div>
-          <div style="font-size:12px;color:#8b949e;" id="jobMeta"></div>
-        </div>
-        <div class="progress-steps" id="progressSteps"></div>
-        <div class="step-labels" id="stepLabels"></div>
-      </div>
-    </div>
-
-    <div class="section-title">Live Logs</div>
-    <div class="log-panel" id="logPanel">
-      <div class="empty-state" id="logEmpty">
+    <div id="taskTimeline">
+      <div class="empty-state" id="timelineEmpty">
         <div class="icon">~</div>
-        Waiting for events...
+        No active tasks. Trigger a job from the Actions tab or Slack.
       </div>
     </div>
   </div>
@@ -214,10 +204,17 @@
 
 <script>
 // --- State ---
-let currentJob = null;
-let logPaused = false;
-const STEP_ORDER = ['fetch-ticket', 'worktree', 'pm-agent', 'dev-agent', 'commit', 'format', 'push-pr', 'code-review'];
-const STEP_LABELS = ['Fetch', 'Worktree', 'PM', 'Dev', 'Commit', 'Format', 'Push', 'Review'];
+const jobs = new Map(); // ticketId -> { ticketId, type, startedAt, steps: [{name, status, startedAt, completedAt}], currentStep, outcome, error, prUrl, recentLogs[] }
+const STEP_NAMES = { 'fetch-ticket': 'Fetch Ticket', 'worktree': 'Prepare Worktree', 'pm-agent': 'PM + Designer Agents', 'dev-agent': 'Dev Agent', 'commit': 'Commit', 'format': 'Format', 'push-pr': 'Push + Create PR', 'push-artifacts': 'Push Artifacts', 'code-review': 'Code Review' };
+const MAX_RECENT_LOGS = 5;
+const MAX_FINISHED_TASKS = 10;
+
+function getJob(ticketId) {
+  if (!jobs.has(ticketId)) {
+    jobs.set(ticketId, { ticketId, type: '?', startedAt: null, steps: [], currentStep: null, outcome: null, error: null, prUrl: null, recentLogs: [] });
+  }
+  return jobs.get(ticketId);
+}
 
 // --- Tab switching ---
 function switchTab(name) {
@@ -243,46 +240,78 @@ function connectSSE() {
     document.getElementById('statusText').textContent = 'Reconnecting...';
   };
 
-  evtSource.addEventListener('reset', () => {
-    fetchStatus();
-  });
+  evtSource.addEventListener('reset', () => { fetchStatus(); });
 
   evtSource.addEventListener('job:start', (e) => {
     const data = JSON.parse(e.data);
-    currentJob = { ticketId: data.ticketId, type: data.type, step: null, startedAt: data.ts };
-    updateJobUI();
-    clearLogs();
-    addLogLine('start', `Job started: ${data.ticketId} (${data.type})`);
+    const job = getJob(data.ticketId);
+    job.type = data.type || 'dev';
+    job.startedAt = data.ts || new Date().toISOString();
+    job.steps = [];
+    job.currentStep = null;
+    job.outcome = null;
+    job.error = null;
+    job.prUrl = null;
+    job.recentLogs = [];
+    renderTimeline();
   });
 
   evtSource.addEventListener('job:step', (e) => {
     const data = JSON.parse(e.data);
-    if (currentJob && currentJob.ticketId === data.ticketId) {
-      currentJob.step = data.step;
-      updateJobUI();
+    const job = getJob(data.ticketId);
+    const now = new Date().toISOString();
+    // Mark previous active step as done
+    if (job.currentStep) {
+      const prev = job.steps.find(s => s.name === job.currentStep);
+      if (prev && prev.status === 'active') {
+        prev.status = 'done';
+        prev.completedAt = now;
+      }
     }
-    addLogLine('step', `Step: ${data.step}`);
+    // Add new step
+    job.steps.push({ name: data.step, status: 'active', startedAt: now, completedAt: null });
+    job.currentStep = data.step;
+    job.recentLogs = []; // clear logs for new step
+    renderTimeline();
   });
 
   evtSource.addEventListener('job:log', (e) => {
     const data = JSON.parse(e.data);
-    addLogLine(data.source || 'stdout', data.message);
+    const job = getJob(data.ticketId);
+    job.recentLogs.push({ source: data.source, message: data.message, level: data.level });
+    if (job.recentLogs.length > MAX_RECENT_LOGS) job.recentLogs.shift();
+    renderTimelineLogOnly(data.ticketId);
   });
 
   evtSource.addEventListener('job:complete', (e) => {
     const data = JSON.parse(e.data);
-    addLogLine('step', `Job complete: ${data.ticketId} (${data.outcome})${data.prUrl ? ' PR: ' + data.prUrl : ''}`);
-    currentJob = null;
-    updateJobUI();
-    hideError();
+    const job = getJob(data.ticketId);
+    const now = new Date().toISOString();
+    // Mark last active step as done
+    if (job.currentStep) {
+      const last = job.steps.find(s => s.name === job.currentStep);
+      if (last && last.status === 'active') { last.status = 'done'; last.completedAt = now; }
+    }
+    job.outcome = data.outcome || 'success';
+    job.prUrl = data.prUrl || null;
+    job.currentStep = null;
+    renderTimeline();
+    pruneFinishedTasks();
   });
 
   evtSource.addEventListener('job:error', (e) => {
     const data = JSON.parse(e.data);
-    addLogLine('stderr', `ERROR: ${data.error}`);
-    showError(data.error);
-    currentJob = null;
-    updateJobUI();
+    const job = getJob(data.ticketId);
+    const now = new Date().toISOString();
+    if (job.currentStep) {
+      const last = job.steps.find(s => s.name === job.currentStep);
+      if (last && last.status === 'active') { last.status = 'error'; last.completedAt = now; }
+    }
+    job.outcome = 'failed';
+    job.error = data.error;
+    job.currentStep = null;
+    renderTimeline();
+    pruneFinishedTasks();
   });
 
   evtSource.addEventListener('queue:update', (e) => {
@@ -292,20 +321,16 @@ function connectSSE() {
 
   evtSource.addEventListener('approval:pending', (e) => {
     const data = JSON.parse(e.data);
-    const el = document.getElementById('approvalCount');
-    el.textContent = parseInt(el.textContent) + 1;
+    document.getElementById('approvalCount').textContent = parseInt(document.getElementById('approvalCount').textContent) + 1;
     pendingApprovalSet.add(data.ticketId);
     updateApprovalsList();
-    addLogLine('step', `Approval pending: ${data.ticketId}`);
   });
 
   evtSource.addEventListener('approval:resolved', (e) => {
     const data = JSON.parse(e.data);
-    const el = document.getElementById('approvalCount');
-    el.textContent = Math.max(0, parseInt(el.textContent) - 1);
+    document.getElementById('approvalCount').textContent = Math.max(0, parseInt(document.getElementById('approvalCount').textContent) - 1);
     pendingApprovalSet.delete(data.ticketId);
     updateApprovalsList();
-    addLogLine('step', `Approval resolved: ${data.ticketId} (${data.decision})`);
   });
 }
 
@@ -314,96 +339,177 @@ async function fetchStatus() {
   try {
     const res = await fetch('/api/status');
     const data = await res.json();
-    document.getElementById('activeCount').textContent = data.activeJobs ? data.activeJobs.length : 0;
-    document.getElementById('activeLabel').textContent = data.activeJobs && data.activeJobs.length > 0
-      ? data.activeJobs.map(j => j.ticketId).join(', ')
-      : 'Idle';
+    const activeJobs = data.activeJobs || [];
+    document.getElementById('activeCount').textContent = activeJobs.length;
+    document.getElementById('activeLabel').textContent = activeJobs.length > 0
+      ? activeJobs.map(j => j.ticketId).join(', ') : 'Idle';
     document.getElementById('queueSize').textContent = data.queueSize || 0;
     document.getElementById('approvalCount').textContent = data.pendingApprovals ? data.pendingApprovals.length : 0;
   } catch (_) {}
 }
 
-// --- Job UI ---
-function updateJobUI() {
-  const section = document.getElementById('currentJobSection');
-  if (!currentJob) {
-    section.style.display = 'none';
-    document.getElementById('activeCount').textContent = '0';
-    document.getElementById('activeLabel').textContent = 'Idle';
+// --- Timeline rendering ---
+function renderTimeline() {
+  const container = document.getElementById('taskTimeline');
+  const emptyEl = document.getElementById('timelineEmpty');
+
+  // Update header metrics
+  const running = Array.from(jobs.values()).filter(j => !j.outcome);
+  document.getElementById('activeCount').textContent = running.length;
+  document.getElementById('activeLabel').textContent = running.length > 0
+    ? running.map(j => j.ticketId).join(', ') : 'Idle';
+
+  if (jobs.size === 0) {
+    if (emptyEl) emptyEl.style.display = '';
     return;
   }
-  section.style.display = 'block';
-  document.getElementById('jobTicketId').textContent = currentJob.ticketId;
-  document.getElementById('jobType').textContent = currentJob.type.toUpperCase();
-  document.getElementById('activeCount').textContent = '1';
-  document.getElementById('activeLabel').textContent = currentJob.ticketId;
-  if (currentJob.startedAt) {
-    document.getElementById('jobMeta').textContent = 'Started ' + new Date(currentJob.startedAt).toLocaleTimeString();
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  // Sort: running first, then most recent finished
+  const sorted = Array.from(jobs.values()).sort((a, b) => {
+    if (!a.outcome && b.outcome) return -1;
+    if (a.outcome && !b.outcome) return 1;
+    return new Date(b.startedAt || 0) - new Date(a.startedAt || 0);
+  });
+
+  // Rebuild cards (keep existing elements by ticketId to reduce flicker)
+  const existingCards = new Map();
+  container.querySelectorAll('.task-card').forEach(el => existingCards.set(el.dataset.ticket, el));
+
+  const fragment = document.createDocumentFragment();
+  for (const job of sorted) {
+    const card = renderTaskCard(job);
+    fragment.appendChild(card);
   }
 
-  // Progress bar
-  const stepsEl = document.getElementById('progressSteps');
-  const labelsEl = document.getElementById('stepLabels');
-  const currentIdx = STEP_ORDER.indexOf(currentJob.step);
-  stepsEl.innerHTML = STEP_ORDER.map((_, i) => {
-    const cls = i < currentIdx ? 'step done' : (i === currentIdx ? 'step active' : 'step');
-    return `<div class="${cls}"></div>`;
+  // Clear and re-append
+  container.querySelectorAll('.task-card').forEach(el => el.remove());
+  container.appendChild(fragment);
+}
+
+function renderTaskCard(job) {
+  const card = document.createElement('div');
+  card.className = `task-card ${job.outcome || 'running'}`;
+  card.dataset.ticket = job.ticketId;
+
+  const elapsed = job.startedAt ? formatDuration(Date.now() - new Date(job.startedAt)) : '';
+  const startTime = job.startedAt ? new Date(job.startedAt).toLocaleTimeString() : '';
+
+  let outcomeHtml = '';
+  if (job.outcome === 'success') {
+    outcomeHtml = `<div class="task-outcome success">Completed${job.prUrl ? ' — <a href="' + escapeHtml(job.prUrl) + '" target="_blank">' + escapeHtml(job.prUrl) + '</a>' : ''}</div>`;
+  } else if (job.outcome === 'failed') {
+    outcomeHtml = `<div class="task-outcome failed">Failed${job.error ? ': ' + escapeHtml(job.error) : ''}</div>`;
+  } else if (job.outcome === 'cancelled') {
+    outcomeHtml = `<div class="task-outcome cancelled">Cancelled</div>`;
+  }
+
+  card.innerHTML = `
+    <div class="task-header">
+      <div>
+        <span class="ticket-id">${escapeHtml(job.ticketId)}</span>
+        <span class="job-type">${escapeHtml((job.type || '').toUpperCase())}</span>
+      </div>
+      <div class="task-meta">${startTime}${!job.outcome ? ' — ' + elapsed : ''}</div>
+    </div>
+    <div class="timeline" id="tl-${job.ticketId}">
+      ${renderSteps(job)}
+    </div>
+    ${outcomeHtml}
+  `;
+  return card;
+}
+
+function renderSteps(job) {
+  if (job.steps.length === 0) return '<div style="color:#484f58;font-size:12px;">Starting...</div>';
+
+  return job.steps.map(step => {
+    const name = STEP_NAMES[step.name] || step.name;
+    const dur = step.completedAt && step.startedAt
+      ? formatDuration(new Date(step.completedAt) - new Date(step.startedAt))
+      : (step.status === 'active' ? formatDuration(Date.now() - new Date(step.startedAt)) : '');
+    const time = step.startedAt ? new Date(step.startedAt).toLocaleTimeString() : '';
+
+    let logsHtml = '';
+    if (step.status === 'active' && job.recentLogs.length > 0) {
+      const lines = job.recentLogs.map(l => {
+        const cls = l.level === 'warn' || l.source === 'stderr' ? 'log-warn' : '';
+        return `<div class="${cls}">${escapeHtml(l.message)}</div>`;
+      }).join('');
+      logsHtml = `<div class="tl-logs">${lines}</div>`;
+    }
+
+    let errorHtml = '';
+    if (step.status === 'error' && job.error) {
+      errorHtml = `<div class="tl-error-msg">${escapeHtml(job.error)}</div>`;
+    }
+
+    return `
+      <div class="tl-item ${step.status}">
+        <div class="tl-dot"></div>
+        <div class="tl-name">${escapeHtml(name)}${dur ? '<span class="tl-duration">' + dur + '</span>' : ''}</div>
+        <div class="tl-time">${time}</div>
+        ${logsHtml}
+        ${errorHtml}
+      </div>
+    `;
   }).join('');
-  labelsEl.innerHTML = STEP_LABELS.map((label, i) => {
-    const cls = i === currentIdx ? 'active-label' : '';
-    return `<span class="${cls}">${label}</span>`;
+}
+
+// Lightweight update: only re-render the logs section of the active step (avoid full re-render on every log line)
+function renderTimelineLogOnly(ticketId) {
+  const job = jobs.get(ticketId);
+  if (!job || !job.currentStep) return;
+  const tlEl = document.getElementById('tl-' + ticketId);
+  if (!tlEl) return;
+  // Find the last tl-item (active step) and update its logs
+  const items = tlEl.querySelectorAll('.tl-item');
+  const lastItem = items[items.length - 1];
+  if (!lastItem || !lastItem.classList.contains('active')) return;
+
+  let logsEl = lastItem.querySelector('.tl-logs');
+  if (!logsEl) {
+    logsEl = document.createElement('div');
+    logsEl.className = 'tl-logs';
+    lastItem.appendChild(logsEl);
+  }
+  logsEl.innerHTML = job.recentLogs.map(l => {
+    const cls = l.level === 'warn' || l.source === 'stderr' ? 'log-warn' : '';
+    return `<div class="${cls}">${escapeHtml(l.message)}</div>`;
   }).join('');
 }
 
-// --- Logs ---
-function clearLogs() {
-  const panel = document.getElementById('logPanel');
-  panel.innerHTML = '';
-  document.getElementById('logEmpty')?.remove();
-}
-
-function addLogLine(source, message) {
-  const panel = document.getElementById('logPanel');
-  const empty = document.getElementById('logEmpty');
-  if (empty) empty.remove();
-
-  const line = document.createElement('div');
-  line.className = 'log-line';
-  const ts = new Date().toLocaleTimeString();
-  const srcClass = source === 'stderr' ? 'src-stderr' : (source === 'step' ? 'src-step' : 'src-stdout');
-  line.innerHTML = `<span class="ts">${ts}</span> <span class="${srcClass}">[${source}]</span> ${escapeHtml(message)}`;
-  panel.appendChild(line);
-
-  // Auto-scroll unless paused
-  if (!logPaused) {
-    panel.scrollTop = panel.scrollHeight;
-  }
-
-  // Cap log lines in DOM
-  while (panel.children.length > 500) {
-    panel.removeChild(panel.firstChild);
+function pruneFinishedTasks() {
+  const finished = Array.from(jobs.entries()).filter(([_, j]) => j.outcome);
+  if (finished.length > MAX_FINISHED_TASKS) {
+    // Remove oldest finished
+    finished.sort((a, b) => new Date(a[1].startedAt || 0) - new Date(b[1].startedAt || 0));
+    for (let i = 0; i < finished.length - MAX_FINISHED_TASKS; i++) {
+      jobs.delete(finished[i][0]);
+    }
   }
 }
+
+// Update elapsed time for running tasks every second
+setInterval(() => {
+  for (const job of jobs.values()) {
+    if (!job.outcome) {
+      const card = document.querySelector(`.task-card[data-ticket="${job.ticketId}"]`);
+      if (card) {
+        const meta = card.querySelector('.task-meta');
+        if (meta && job.startedAt) {
+          const startTime = new Date(job.startedAt).toLocaleTimeString();
+          meta.textContent = startTime + ' — ' + formatDuration(Date.now() - new Date(job.startedAt));
+        }
+      }
+    }
+  }
+}, 1000);
 
 function escapeHtml(text) {
   const div = document.createElement('div');
-  div.textContent = text;
+  div.textContent = text || '';
   return div.innerHTML;
-}
-
-// Pause auto-scroll on hover
-const logPanel = document.getElementById('logPanel');
-logPanel.addEventListener('mouseenter', () => { logPaused = true; });
-logPanel.addEventListener('mouseleave', () => { logPaused = false; });
-
-// --- Error banner ---
-function showError(msg) {
-  const banner = document.getElementById('errorBanner');
-  banner.textContent = msg;
-  banner.classList.add('visible');
-}
-function hideError() {
-  document.getElementById('errorBanner').classList.remove('visible');
 }
 
 // --- History ---
