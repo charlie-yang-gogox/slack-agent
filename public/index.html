@@ -65,6 +65,17 @@
   .tl-logs .log-warn { color: #d29922; }
   .tl-error-msg { margin-top: 4px; font-size: 11px; color: #f85149; }
 
+  /* Inline card actions */
+  .card-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid #30363d; }
+  .card-actions .action-input { margin: 0; width: 180px; padding: 6px 8px; }
+  .card-actions .action-btn { padding: 6px 12px; font-size: 11px; }
+
+  /* New job form in Live tab */
+  .new-job-bar { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .new-job-bar .action-input { margin: 0; width: 140px; padding: 6px 8px; }
+  .new-job-bar .action-btn { padding: 6px 12px; font-size: 11px; }
+  .new-job-bar select { padding: 6px 8px; border: 1px solid #30363d; border-radius: 4px; font-family: inherit; font-size: 12px; background: #0d1117; color: #c9d1d9; }
+
   .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin: 14px 0 8px; }
 
   .empty-state { text-align: center; padding: 40px 20px; color: #484f58; }
@@ -139,10 +150,22 @@
       </div>
     </div>
 
+    <div class="new-job-bar">
+      <select id="newJobType">
+        <option value="ff">FF</option>
+        <option value="dev">Dev</option>
+        <option value="prd">PRD</option>
+      </select>
+      <input class="action-input" type="text" id="newJobTicket" placeholder="Ticket ID" />
+      <input class="action-input" type="text" id="newJobInstructions" placeholder="Instructions (optional)" style="flex:1;min-width:120px;" />
+      <button class="action-btn primary" onclick="triggerNewJob()">Start</button>
+      <span id="newJobResult" style="font-size:11px;"></span>
+    </div>
+
     <div id="taskTimeline">
       <div class="empty-state" id="timelineEmpty">
         <div class="icon">~</div>
-        No active tasks. Trigger a job from the Actions tab or Slack.
+        No active tasks
       </div>
     </div>
   </div>
@@ -211,7 +234,7 @@ const MAX_FINISHED_TASKS = 10;
 
 function getJob(ticketId) {
   if (!jobs.has(ticketId)) {
-    jobs.set(ticketId, { ticketId, type: '?', startedAt: null, steps: [], currentStep: null, outcome: null, error: null, prUrl: null, recentLogs: [] });
+    jobs.set(ticketId, { ticketId, type: '?', startedAt: null, steps: [], currentStep: null, outcome: null, error: null, prUrl: null, recentLogs: [], waitingApproval: false });
   }
   return jobs.get(ticketId);
 }
@@ -323,6 +346,8 @@ function connectSSE() {
     const data = JSON.parse(e.data);
     document.getElementById('approvalCount').textContent = parseInt(document.getElementById('approvalCount').textContent) + 1;
     pendingApprovalSet.add(data.ticketId);
+    const job = jobs.get(data.ticketId);
+    if (job) { job.waitingApproval = true; renderTimeline(); }
     updateApprovalsList();
   });
 
@@ -330,6 +355,8 @@ function connectSSE() {
     const data = JSON.parse(e.data);
     document.getElementById('approvalCount').textContent = Math.max(0, parseInt(document.getElementById('approvalCount').textContent) - 1);
     pendingApprovalSet.delete(data.ticketId);
+    const job = jobs.get(data.ticketId);
+    if (job) { job.waitingApproval = false; renderTimeline(); }
     updateApprovalsList();
   });
 }
@@ -404,6 +431,26 @@ function renderTaskCard(job) {
     outcomeHtml = `<div class="task-outcome cancelled">Cancelled</div>`;
   }
 
+  // Inline actions based on job state
+  let actionsHtml = '';
+  if (!job.outcome) {
+    if (job.waitingApproval) {
+      // Waiting for approval: show approve + reject
+      actionsHtml = `
+        <div class="card-actions">
+          <input class="action-input" type="text" placeholder="Instructions (optional)" id="card-instr-${job.ticketId}" />
+          <button class="action-btn primary" onclick="approveTicket('${escapeHtml(job.ticketId)}', document.getElementById('card-instr-${job.ticketId}').value)">Approve</button>
+          <button class="action-btn danger" onclick="rejectTicket('${escapeHtml(job.ticketId)}')">Reject</button>
+        </div>`;
+    } else {
+      // Running: show cancel
+      actionsHtml = `
+        <div class="card-actions">
+          <button class="action-btn danger" onclick="cancelTicket('${escapeHtml(job.ticketId)}')">Cancel</button>
+        </div>`;
+    }
+  }
+
   card.innerHTML = `
     <div class="task-header">
       <div>
@@ -416,6 +463,7 @@ function renderTaskCard(job) {
       ${renderSteps(job)}
     </div>
     ${outcomeHtml}
+    ${actionsHtml}
   `;
   return card;
 }
@@ -563,7 +611,58 @@ function formatDuration(ms) {
   return m + 'm ' + sec + 's';
 }
 
-// --- Actions ---
+// --- Inline card actions ---
+async function cancelTicket(ticketId) {
+  try {
+    const res = await fetch('/api/jobs/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticketId }),
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      console.error('Cancel failed:', data.error);
+    }
+  } catch (err) {
+    console.error('Cancel failed:', err.message);
+  }
+}
+
+async function triggerNewJob() {
+  const type = document.getElementById('newJobType').value;
+  const ticketId = document.getElementById('newJobTicket').value.trim();
+  const instructions = document.getElementById('newJobInstructions').value.trim();
+  const resultEl = document.getElementById('newJobResult');
+
+  if (!ticketId) { resultEl.textContent = 'Enter a ticket ID'; resultEl.style.color = '#f85149'; return; }
+
+  const body = { ticketId };
+  if (instructions) body.instructions = instructions;
+
+  try {
+    const res = await fetch(`/api/jobs/${type}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      resultEl.textContent = `Queued ${data.ticketId}`;
+      resultEl.style.color = '#3fb950';
+      document.getElementById('newJobTicket').value = '';
+      document.getElementById('newJobInstructions').value = '';
+      setTimeout(() => { resultEl.textContent = ''; }, 3000);
+    } else {
+      resultEl.textContent = data.error || 'Failed';
+      resultEl.style.color = '#f85149';
+    }
+  } catch (err) {
+    resultEl.textContent = err.message;
+    resultEl.style.color = '#f85149';
+  }
+}
+
+// --- Actions tab ---
 async function triggerJob(type) {
   const ticketInput = document.getElementById(type + 'Ticket');
   const resultEl = document.getElementById(type + 'Result');
