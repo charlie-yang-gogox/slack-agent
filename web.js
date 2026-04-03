@@ -259,6 +259,90 @@ app.get("/api/history/:ticketId", (req, res) => {
   }
 });
 
+// --- Phase 2: Action endpoints ---
+let agentModule = null;
+function getAgent() {
+  if (!agentModule) agentModule = require("./agent");
+  return agentModule;
+}
+
+// Trigger FF
+app.post("/api/jobs/ff", (req, res) => {
+  try {
+    const { ticketId, instructions } = req.body || {};
+    if (!ticketId) return res.status(422).json({ error: "ticketId is required" });
+    const result = getAgent().triggerFF(ticketId.toUpperCase(), instructions);
+    if (!result.ok) return res.status(409).json({ error: result.error });
+    res.status(202).json({ ticketId: ticketId.toUpperCase(), status: "queued" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Trigger Dev
+app.post("/api/jobs/dev", (req, res) => {
+  try {
+    const { ticketId } = req.body || {};
+    if (!ticketId) return res.status(422).json({ error: "ticketId is required" });
+    const result = getAgent().triggerDev(ticketId.toUpperCase());
+    if (!result.ok) return res.status(409).json({ error: result.error });
+    res.status(202).json({ ticketId: ticketId.toUpperCase(), status: "queued" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Trigger PRD
+app.post("/api/jobs/prd", (req, res) => {
+  try {
+    const { ticketId } = req.body || {};
+    if (!ticketId) return res.status(422).json({ error: "ticketId is required" });
+    const result = getAgent().triggerPRD(ticketId.toUpperCase());
+    if (!result.ok) return res.status(409).json({ error: result.error });
+    res.status(202).json({ ticketId: ticketId.toUpperCase(), status: "queued" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Cancel job
+app.post("/api/jobs/cancel", (req, res) => {
+  try {
+    const { ticketId } = req.body || {};
+    if (!ticketId) return res.status(422).json({ error: "ticketId is required" });
+    const result = getAgent().cancelJob(ticketId.toUpperCase());
+    if (!result.ok) return res.status(404).json({ error: result.error });
+    res.json({ ticketId: ticketId.toUpperCase(), status: "cancelled" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Approve
+app.post("/api/approvals/:ticketId/approve", (req, res) => {
+  try {
+    const ticketId = req.params.ticketId.toUpperCase();
+    const { instructions } = req.body || {};
+    const result = getAgent().resolveApproval(ticketId, "approve", instructions);
+    if (!result.ok) return res.status(404).json({ error: result.error });
+    res.json({ ticketId, status: "approved" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Reject
+app.post("/api/approvals/:ticketId/reject", (req, res) => {
+  try {
+    const ticketId = req.params.ticketId.toUpperCase();
+    const result = getAgent().resolveApproval(ticketId, "reject");
+    if (!result.ok) return res.status(404).json({ error: result.error });
+    res.json({ ticketId, status: "rejected" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // SSE endpoint
 let sseClientIdCounter = 0;
 

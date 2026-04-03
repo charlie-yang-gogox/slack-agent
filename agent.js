@@ -73,11 +73,21 @@ registerStatusProvider(() => {
   return {
     activeJobs: active,
     queueSize: queue.size + queue.pending,
-    pendingApprovals: Array.from(pendingApprovals.keys()),
+    pendingApprovals: Array.from(new Set([...pendingApprovals.keys(), ...ticketApprovals.keys()])),
     ffTickets: Array.from(ffTickets),
     uptime: process.uptime(),
   };
 });
+
+// --- Ticket-based approval map (for web UI — parallel to threadTs-based pendingApprovals) ---
+const ticketApprovals = new Map(); // ticketId → { resolve }
+
+// --- Shim Slack client for web-triggered jobs (no-op posting) ---
+const webClient = {
+  chat: { postMessage: async () => {} },
+  reactions: { add: async () => {} },
+  conversations: { replies: async () => ({ messages: [] }) },
+};
 
 // --- Cleanup helper (centralizes state cleanup for a ticket) ---
 function cleanupTicket(ticketId) {
@@ -85,6 +95,7 @@ function cleanupTicket(ticketId) {
   cancelledTickets.delete(ticketId);
   ffTickets.delete(ticketId);
   ffTicketExtras.delete(ticketId);
+  ticketApprovals.delete(ticketId);
 }
 
 // --- Helpers ---
@@ -399,13 +410,22 @@ function isRecentlyQueued(ticketId) {
   return true;
 }
 
-function waitForApproval(threadTs, timeoutMs = 60 * 60 * 1000) {
+function waitForApproval(threadTs, timeoutMs = 60 * 60 * 1000, ticketId = null) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingApprovals.delete(threadTs);
+      if (ticketId) ticketApprovals.delete(ticketId);
       resolve({ approved: false, extra: "" });
     }, timeoutMs);
-    pendingApprovals.set(threadTs, { resolve: (val) => { clearTimeout(timer); resolve(val); } });
+    const resolver = (val) => {
+      clearTimeout(timer);
+      pendingApprovals.delete(threadTs);
+      if (ticketId) ticketApprovals.delete(ticketId);
+      resolve(val);
+    };
+    pendingApprovals.set(threadTs, { resolve: resolver });
+    // Also register by ticketId so web UI can resolve
+    if (ticketId) ticketApprovals.set(ticketId, { resolve: resolver });
   });
 }
 
@@ -966,7 +986,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
       }
       agentEvents.emit("approval:resolved", { ticketId, decision: "auto-approved" });
     } else {
-      ({ approved, extra } = await waitForApproval(threadTs));
+      ({ approved, extra } = await waitForApproval(threadTs, undefined, ticketId));
       agentEvents.emit("approval:resolved", { ticketId, decision: approved ? "approved" : "rejected" });
       if (!approved) {
         await postThread(client, channelId, threadTs, `Cancelled \`${ticketId}\`.`);
@@ -1148,6 +1168,129 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     cleanupTicket(ticketId);
   }
 }
+
+// --- Web API: exported functions for web.js to trigger jobs ---
+function triggerFF(ticketId, instructions) {
+  if (isRecentlyQueued(ticketId)) return { ok: false, error: "Already queued" };
+  recentTickets.set(ticketId, Date.now());
+  ffTickets.add(ticketId);
+  if (instructions) ffTicketExtras.set(ticketId, instructions);
+
+  queue.add(async () => {
+    agentEvents.emit("job:start", { ticketId, type: "ff", user: "web", ts: new Date().toISOString() });
+    agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    let worktreePath, branch;
+    try {
+      agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
+      run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+      agentEvents.emit("job:step", { ticketId, step: "worktree" });
+      ({ worktreePath, branch } = ensureWorktree(ticketId));
+
+      const changesDir = path.join(worktreePath, "openspec", "changes");
+      const { hasArtifacts } = checkArtifacts(changesDir);
+
+      if (!hasArtifacts) {
+        if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+        agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
+        await runPMPhase(ticketId, worktreePath, null, null);
+        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+      }
+
+      // Hand off to dev (inline, not via Slack mention)
+      await runDevJob(ticketId, null, ticketId, webClient, "", { isFF: true, isFromThread: false });
+    } catch (err) {
+      if (!cancelledTickets.has(ticketId)) {
+        agentEvents.emit("job:error", { ticketId, error: err.message });
+      }
+      ffTickets.delete(ticketId);
+      ffTicketExtras.delete(ticketId);
+    } finally {
+      cancelledTickets.delete(ticketId);
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    }
+  });
+  return { ok: true };
+}
+
+function triggerDev(ticketId) {
+  if (isRecentlyQueued(ticketId)) return { ok: false, error: "Already queued" };
+  recentTickets.set(ticketId, Date.now());
+  queue.add(() => runDevJob(ticketId, null, ticketId, webClient, "", { isFF: false, isFromThread: false }));
+  return { ok: true };
+}
+
+function triggerPRD(ticketId) {
+  if (isRecentlyQueued(ticketId)) return { ok: false, error: "Already queued" };
+  recentTickets.set(ticketId, Date.now());
+
+  queue.add(async () => {
+    agentEvents.emit("job:start", { ticketId, type: "prd", user: "web", ts: new Date().toISOString() });
+    agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    let worktreePath, branch;
+    try {
+      agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
+      run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+      agentEvents.emit("job:step", { ticketId, step: "worktree" });
+      ({ worktreePath, branch } = ensureWorktree(ticketId));
+
+      const changesDir = path.join(worktreePath, "openspec", "changes");
+      const { hasArtifacts } = checkArtifacts(changesDir);
+
+      if (hasArtifacts) {
+        agentEvents.emit("job:log", { ticketId, source: "system", message: "Artifacts already exist, skipping generation." });
+      } else {
+        if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+        agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
+        await runPMPhase(ticketId, worktreePath, null, null);
+        agentEvents.emit("job:step", { ticketId, step: "push-artifacts" });
+        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+      }
+      agentEvents.emit("job:complete", { ticketId, outcome: "success" });
+    } catch (err) {
+      if (!cancelledTickets.has(ticketId)) {
+        agentEvents.emit("job:error", { ticketId, error: err.message });
+      }
+    } finally {
+      cancelledTickets.delete(ticketId);
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    }
+  });
+  return { ok: true };
+}
+
+function cancelJob(ticketId) {
+  const active = activeProcesses.get(ticketId);
+  if (!active) return { ok: false, error: "No running job found" };
+  active.proc.kill("SIGTERM");
+  cancelledTickets.add(ticketId);
+  activeProcesses.delete(ticketId);
+  recentTickets.delete(ticketId);
+  const approvalThreadTs = active.threadTs;
+  if (approvalThreadTs) pendingApprovals.delete(approvalThreadTs);
+  ticketApprovals.delete(ticketId);
+
+  const worktreePath = path.join(WORKTREE_BASE, ticketId);
+  const branch = `feat/${ticketId}`;
+  if (fs.existsSync(worktreePath)) {
+    spawnSync("git", ["worktree", "remove", "--force", worktreePath], { cwd: REPO_ROOT, encoding: "utf8" });
+  }
+  spawnSync("git", ["branch", "-D", branch], { cwd: REPO_ROOT, encoding: "utf8" });
+  agentEvents.emit("job:complete", { ticketId, outcome: "cancelled" });
+  return { ok: true };
+}
+
+function resolveApproval(ticketId, decision, instructions) {
+  const pending = ticketApprovals.get(ticketId);
+  if (!pending) return { ok: false, error: "No pending approval for this ticket" };
+  pending.resolve({ approved: decision === "approve", extra: instructions || "" });
+  return { ok: true };
+}
+
+module.exports = { triggerFF, triggerDev, triggerPRD, cancelJob, resolveApproval, ticketApprovals };
 
 // --- Uncaught error handlers (prevent dashboard crashes from killing agent) ---
 process.on("uncaughtException", (err) => {
