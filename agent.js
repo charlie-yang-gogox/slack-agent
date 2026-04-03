@@ -518,6 +518,15 @@ function ensureWorktree(ticketId) {
     run("git", ["worktree", "add", "-b", branch, worktreePath, "origin/trunk"], { cwd: REPO_ROOT });
   }
 
+  // Copy .claude/settings.local.json from main repo (permissions don't travel with git)
+  const srcSettings = path.join(REPO_ROOT, ".claude", "settings.local.json");
+  const dstDir = path.join(worktreePath, ".claude");
+  const dstSettings = path.join(dstDir, "settings.local.json");
+  if (fs.existsSync(srcSettings) && !fs.existsSync(dstSettings)) {
+    fs.mkdirSync(dstDir, { recursive: true });
+    fs.copyFileSync(srcSettings, dstSettings);
+  }
+
   return { worktreePath, branch, created: true };
 }
 
