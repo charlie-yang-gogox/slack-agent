@@ -7,6 +7,7 @@ const PQueue = require("p-queue").default;
 const { spawnSync, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { agentEvents, registerStatusProvider } = require("./events");
 
 // --- Constants (from env or defaults) ---
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
@@ -62,6 +63,30 @@ const pendingConfirmations = new Map(); // threadTs → { resolve }
 const ffTickets = new Set(); // ticketIds currently in ff mode → skip approve + worktree confirm in dev
 const ffTicketExtras = new Map(); // ticketId → extra instructions string
 
+// --- Status provider for web dashboard ---
+registerStatusProvider(() => {
+  const active = activeProcesses.size > 0 ? Array.from(activeProcesses.entries()).map(([id, info]) => ({
+    ticketId: id,
+    threadTs: info.threadTs,
+    channelId: info.channelId,
+  })) : [];
+  return {
+    activeJobs: active,
+    queueSize: queue.size + queue.pending,
+    pendingApprovals: Array.from(pendingApprovals.keys()),
+    ffTickets: Array.from(ffTickets),
+    uptime: process.uptime(),
+  };
+});
+
+// --- Cleanup helper (centralizes state cleanup for a ticket) ---
+function cleanupTicket(ticketId) {
+  recentTickets.delete(ticketId);
+  cancelledTickets.delete(ticketId);
+  ffTickets.delete(ticketId);
+  ffTicketExtras.delete(ticketId);
+}
+
 // --- Helpers ---
 async function postThread(client, channelId, threadTs, text) {
   try {
@@ -95,14 +120,40 @@ function runAsync(cmd, args, opts = {}) {
     });
     let stdout = "";
     let stderr = "";
+    let lineBuf = ""; // dual buffer for line-based event emission
     if (opts.input) proc.stdin.end(opts.input);
-    proc.stdout.on("data", (d) => { stdout += d; process.stdout.write(d); });
-    proc.stderr.on("data", (d) => { stderr += d; process.stderr.write(d); });
+    proc.stdout.on("data", (d) => {
+      stdout += d;
+      process.stdout.write(d);
+      // Line-based emission for dashboard
+      if (opts.ticketId) {
+        lineBuf += d;
+        const lines = lineBuf.split("\n");
+        lineBuf = lines.pop(); // keep incomplete last line in buffer
+        for (const line of lines) {
+          if (line.trim()) {
+            agentEvents.emit("job:log", { ticketId: opts.ticketId, source: "stdout", message: line, ts: new Date().toISOString() });
+          }
+        }
+      }
+    });
+    proc.stderr.on("data", (d) => {
+      stderr += d;
+      process.stderr.write(d);
+      if (opts.ticketId && d.toString().trim()) {
+        agentEvents.emit("job:log", { ticketId: opts.ticketId, source: "stderr", message: d.toString().trim(), level: "warn", ts: new Date().toISOString() });
+      }
+    });
     proc.on("error", (err) => {
       if (opts.ticketId) activeProcesses.delete(opts.ticketId);
       reject(err);
     });
     proc.on("close", (code) => {
+      // Flush remaining line buffer
+      if (opts.ticketId && lineBuf.trim()) {
+        agentEvents.emit("job:log", { ticketId: opts.ticketId, source: "stdout", message: lineBuf.trim(), ts: new Date().toISOString() });
+        lineBuf = "";
+      }
       if (opts.ticketId) activeProcesses.delete(opts.ticketId);
       if (code !== 0) {
         reject(new Error(`Command failed (exit ${code}): ${cmd} ${args.join(" ")}\n${(stderr || stdout).trim()}`));
@@ -516,12 +567,16 @@ pmApp.event("app_mention", async ({ event, client }) => {
     await postThread(client, channelId, threadTs, `Generating PRD + OpenSpec artifacts for \`${ticketId}\`...`);
 
     queue.add(async () => {
+      agentEvents.emit("job:start", { ticketId, type: "prd", user: requesterId, ts: new Date().toISOString() });
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
       let worktreePath, branch;
       try {
         // Fetch ticket
+        agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
         run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
 
         // Create or reuse worktree with feature branch (asks user if exists)
+        agentEvents.emit("job:step", { ticketId, step: "worktree" });
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
         // Check if artifacts already exist (must have proposal.md to be considered complete)
@@ -534,10 +589,12 @@ pmApp.event("app_mention", async ({ event, client }) => {
           );
         } else {
           if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+          agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
           await postThread(client, channelId, threadTs, `PM + Designer agents working on \`${branch}\`...`);
           await runPMPhase(ticketId, worktreePath, channelId, threadTs);
 
           // Ensure artifacts are committed and pushed (safety net)
+          agentEvents.emit("job:step", { ticketId, step: "push-artifacts" });
           spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
           spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
           run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
@@ -545,6 +602,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
 
         // Post artifact contents to Slack (both skip and generate paths)
         await postArtifactsToSlack(changesDir, client, channelId, threadTs);
+        agentEvents.emit("job:complete", { ticketId, outcome: "success" });
 
         // Mention requester
         await postThread(client, channelId, threadTs,
@@ -568,9 +626,11 @@ pmApp.event("app_mention", async ({ event, client }) => {
           return;
         }
         console.error(`[PRD ${ticketId}] failed:`, err.message);
+        agentEvents.emit("job:error", { ticketId, error: err.message });
         await postThread(client, channelId, threadTs, `PRD generation failed: ${err.message}`);
       } finally {
         cancelledTickets.delete(ticketId);
+        agentEvents.emit("queue:update", { size: queue.size + queue.pending });
       }
     });
 
@@ -581,12 +641,16 @@ pmApp.event("app_mention", async ({ event, client }) => {
     await postThread(client, channelId, threadTs, `FF mode: generating artifacts for \`${ticketId}\` then handing off to Dev...`);
 
     queue.add(async () => {
+      agentEvents.emit("job:start", { ticketId, type: "ff", user: requesterId, ts: new Date().toISOString() });
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
       let worktreePath, branch;
       try {
         // Fetch ticket
+        agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
         run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
 
         // Create or reuse worktree with feature branch (asks user if exists)
+        agentEvents.emit("job:step", { ticketId, step: "worktree" });
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
         // Check if artifacts already exist (must have proposal.md to be considered complete)
@@ -600,6 +664,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
         } else {
           // Run PM + Designer agents
           if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+          agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
           await postThread(client, channelId, threadTs, `PM + Designer agents working on \`${branch}\`...`);
           await runPMPhase(ticketId, worktreePath, channelId, threadTs);
 
@@ -631,6 +696,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
         console.error(`[FF ${ticketId}] failed:`, err.message);
         ffTickets.delete(ticketId);
         ffTicketExtras.delete(ticketId);
+        agentEvents.emit("job:error", { ticketId, error: err.message });
         await postThread(client, channelId, threadTs, `FF mode failed (PM phase): ${err.message}`);
       } finally {
         cancelledTickets.delete(ticketId);
@@ -817,10 +883,13 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
   const jobTimer = setTimeout(() => { jobTimedOut = true; }, JOB_TIMEOUT_MS);
 
   let worktreePath, branch;
+  agentEvents.emit("job:start", { ticketId, type: opts.isFF ? "ff-dev" : "dev", user: "slack", ts: new Date().toISOString() });
+  agentEvents.emit("queue:update", { size: queue.size + queue.pending });
 
   try {
     // Step 1: Fetch ticket + Linear update (skip fetch if FF already has it)
     if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+    agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
     const ticketCachePath = `/tmp/ticket-${ticketId}.json`;
     if (opts.isFF && fs.existsSync(ticketCachePath)) {
       await postThread(client, channelId, threadTs, `Ticket \`${ticketId}\` already fetched, updating Linear...`);
@@ -834,6 +903,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     if (jobTimedOut) throw new Error("Job timed out");
 
     // Step 2: Create or reuse worktree with feature branch
+    agentEvents.emit("job:step", { ticketId, step: "worktree" });
     await postThread(client, channelId, threadTs, `Preparing workspace...`);
     if (opts.isFF || opts.isFromThread) {
       // FF mode or thread trigger: worktree already exists, skip interactive confirmation
@@ -882,6 +952,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
       }
     }
 
+    agentEvents.emit("approval:pending", { ticketId });
     let approved, extra;
     if (opts.isFF) {
       // FF mode: auto-approve, no user interaction needed
@@ -893,8 +964,10 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
         extra = ffExtra;
         ffTicketExtras.delete(ticketId);
       }
+      agentEvents.emit("approval:resolved", { ticketId, decision: "auto-approved" });
     } else {
       ({ approved, extra } = await waitForApproval(threadTs));
+      agentEvents.emit("approval:resolved", { ticketId, decision: approved ? "approved" : "rejected" });
       if (!approved) {
         await postThread(client, channelId, threadTs, `Cancelled \`${ticketId}\`.`);
         return;
@@ -966,6 +1039,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     }
 
     // Step 4b: dev-agent (opsx:apply + verify + test)
+    agentEvents.emit("job:step", { ticketId, step: "dev-agent" });
     const { dirs: artifactDirs } = checkArtifacts(changesDir);
     const artifactSlug = artifactDirs[0] || "";
     const devContext = buildTicketContext(ticketId, worktreePath, applyExtra);
@@ -987,16 +1061,19 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
     // Step 5: /commit
+    agentEvents.emit("job:step", { ticketId, step: "commit" });
     await runSkill("commit", `/commit\n\nDo not ask for confirmation. Commit all changes automatically.\nIMPORTANT: You are working in a git worktree at ${worktreePath} on branch ${branch}. All git commands must run inside this directory. Do NOT commit to any other branch or directory.`);
     safetyCommit(worktreePath, ticketId, "after /commit");
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
     // Step 6: /format
+    agentEvents.emit("job:step", { ticketId, step: "format" });
     await runSkill("format", `/format\n\nDo not ask for confirmation. Format and commit automatically.\nIMPORTANT: You are working in a git worktree at ${worktreePath} on branch ${branch}. All git commands must run inside this directory.`);
     safetyCommit(worktreePath, ticketId, "after /format");
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
     // Step 7: archive openspec, commit any remaining changes, push + create PR
+    agentEvents.emit("job:step", { ticketId, step: "push-pr" });
     await postThread(client, channelId, threadTs, `Pushing and creating PR...`);
     const changesDir2 = path.join(worktreePath, "openspec", "changes");
     const archiveDir = path.join(changesDir2, "archive");
@@ -1024,6 +1101,7 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     if (fs.existsSync(prUrlFile)) { prUrl = fs.readFileSync(prUrlFile, "utf8").trim(); }
 
     // Step 8: /code-review
+    agentEvents.emit("job:step", { ticketId, step: "code-review" });
     const reviewOut = await runSkill("code-review", `/code-review\n\nAfter generating the review, automatically post it as a comment on the PR. Do not ask for confirmation.\nIMPORTANT: You are working in a git worktree at ${worktreePath} on branch ${branch}.`);
     const reviewTruncated = reviewOut.trim().slice(-2000) || "(no output)";
     await postThread(client, channelId, threadTs, `Code review:\n\`\`\`\n${reviewTruncated}\n\`\`\``);
@@ -1031,6 +1109,7 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     const successMsg = prUrl
       ? `All done! PR ready: ${prUrl}`
       : `All done! \`${ticketId}\` implementation complete.`;
+    agentEvents.emit("job:complete", { ticketId, outcome: "success", prUrl });
     await postThread(client, channelId, threadTs, successMsg);
 
     const sessionId = getLatestSessionId();
@@ -1042,8 +1121,10 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
   } catch (err) {
     if (cancelledTickets.has(ticketId)) {
       console.log(`[${ticketId}] Job cancelled.`);
+      agentEvents.emit("job:complete", { ticketId, outcome: "cancelled" });
       return;
     }
+    agentEvents.emit("job:error", { ticketId, error: err.message });
     // Safety commit on failure — preserve any partial implementation
     if (worktreePath && fs.existsSync(worktreePath)) {
       safetyCommit(worktreePath, ticketId, "on failure");
@@ -1064,14 +1145,19 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     }
   } finally {
     clearTimeout(jobTimer);
-    recentTickets.delete(ticketId);
-    cancelledTickets.delete(ticketId);
-    ffTickets.delete(ticketId);
-    ffTicketExtras.delete(ticketId);
+    cleanupTicket(ticketId);
   }
 }
 
-// --- Start both bots ---
+// --- Uncaught error handlers (prevent dashboard crashes from killing agent) ---
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT]", err.message);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("[UNHANDLED]", err && err.message ? err.message : err);
+});
+
+// --- Start both bots + web dashboard ---
 (async () => {
   const [pmAuth, devAuth] = await Promise.all([
     pmApp.client.auth.test(),
@@ -1082,4 +1168,12 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
 
   await Promise.all([pmApp.start(), devApp.start()]);
   console.log("PM agent + Dev agent running (Socket Mode)");
+
+  // Start web dashboard
+  try {
+    require("./web");
+  } catch (err) {
+    console.error("[web] Dashboard failed to start:", err.message);
+    console.error("[web] Agent continues without dashboard.");
+  }
 })();

@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Slack Dev Agent</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace; background: #0d1117; color: #c9d1d9; font-size: 13px; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { font-size: 14px; font-weight: 600; color: #f0f6fc; letter-spacing: 0.5px; }
+  .header .status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #8b949e; }
+  .header .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.online { background: #3fb950; }
+  .dot.offline { background: #f85149; }
+
+  .tabs { display: flex; gap: 0; border-bottom: 1px solid #30363d; background: #161b22; }
+  .tab { padding: 10px 20px; cursor: pointer; border-bottom: 2px solid transparent; color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .tab:hover { color: #c9d1d9; }
+  .tab.active { color: #f0f6fc; border-bottom-color: #58a6ff; }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* Cards */
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 14px; }
+  .card h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin-bottom: 8px; }
+  .metric { font-size: 24px; font-weight: 700; color: #f0f6fc; }
+  .metric-label { font-size: 11px; color: #8b949e; margin-top: 2px; }
+
+  /* Current job */
+  .current-job { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+  .job-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .ticket-id { font-size: 16px; font-weight: 700; color: #f0f6fc; }
+  .job-type { background: #1f6feb33; color: #58a6ff; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+
+  .progress-steps { display: flex; gap: 3px; margin: 10px 0; }
+  .step { flex: 1; height: 4px; border-radius: 2px; background: #30363d; }
+  .step.done { background: #3fb950; }
+  .step.active { background: #d29922; }
+  .step-labels { display: flex; justify-content: space-between; font-size: 10px; color: #8b949e; }
+  .step-labels .active-label { color: #d29922; font-weight: 600; }
+
+  /* Error banner */
+  .error-banner { background: #f8514933; border: 1px solid #f85149; border-radius: 6px; padding: 10px 14px; margin-bottom: 12px; color: #f85149; font-size: 12px; display: none; }
+  .error-banner.visible { display: block; }
+
+  /* Log panel */
+  .log-panel { background: #010409; border: 1px solid #30363d; border-radius: 6px; padding: 12px; font-size: 12px; line-height: 1.6; max-height: 400px; overflow-y: auto; }
+  .log-line { white-space: pre-wrap; word-break: break-all; color: #8b949e; }
+  .log-line .ts { color: #484f58; }
+  .log-line .src-stdout { color: #58a6ff; }
+  .log-line .src-stderr { color: #d29922; }
+  .log-line .src-step { color: #3fb950; font-weight: 600; }
+
+  .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin: 14px 0 8px; }
+
+  .empty-state { text-align: center; padding: 40px 20px; color: #484f58; }
+  .empty-state .icon { font-size: 32px; margin-bottom: 8px; }
+
+  /* History table */
+  .history-table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
+  .history-table th { background: #0d1117; text-align: left; padding: 10px 14px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; border-bottom: 1px solid #30363d; }
+  .history-table td { padding: 10px 14px; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .history-table tr:hover { background: #1c2128; }
+  .status-badge { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  .status-badge.success { background: #23863633; color: #3fb950; }
+  .status-badge.running { background: #9e6a0333; color: #d29922; }
+  .status-badge.failed { background: #f8514933; color: #f85149; }
+  .status-badge.cancelled { background: #484f5833; color: #8b949e; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>SLACK DEV AGENT</h1>
+  <div class="status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">Connecting...</span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('live')">Live</div>
+  <div class="tab" onclick="switchTab('history')">History</div>
+</div>
+
+<!-- LIVE TAB -->
+<div class="tab-content active" id="tab-live">
+  <div class="container">
+    <div class="grid" style="margin-top: 16px;">
+      <div class="card">
+        <h3>Active Jobs</h3>
+        <div class="metric" id="activeCount">0</div>
+        <div class="metric-label" id="activeLabel">Idle</div>
+      </div>
+      <div class="card">
+        <h3>Queue</h3>
+        <div class="metric" id="queueSize">0</div>
+        <div class="metric-label">pending</div>
+      </div>
+      <div class="card">
+        <h3>Approvals</h3>
+        <div class="metric" id="approvalCount">0</div>
+        <div class="metric-label">waiting</div>
+      </div>
+    </div>
+
+    <div class="error-banner" id="errorBanner"></div>
+
+    <div id="currentJobSection" style="display:none;">
+      <div class="current-job">
+        <div class="job-header">
+          <div>
+            <span class="ticket-id" id="jobTicketId"></span>
+            <span class="job-type" id="jobType"></span>
+          </div>
+          <div style="font-size:12px;color:#8b949e;" id="jobMeta"></div>
+        </div>
+        <div class="progress-steps" id="progressSteps"></div>
+        <div class="step-labels" id="stepLabels"></div>
+      </div>
+    </div>
+
+    <div class="section-title">Live Logs</div>
+    <div class="log-panel" id="logPanel">
+      <div class="empty-state" id="logEmpty">
+        <div class="icon">~</div>
+        Waiting for events...
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- HISTORY TAB -->
+<div class="tab-content" id="tab-history">
+  <div class="container" style="margin-top: 16px;">
+    <div id="historyContent">
+      <div class="empty-state">
+        <div class="icon">~</div>
+        Loading history...
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// --- State ---
+let currentJob = null;
+let logPaused = false;
+const STEP_ORDER = ['fetch-ticket', 'worktree', 'pm-agent', 'dev-agent', 'commit', 'format', 'push-pr', 'code-review'];
+const STEP_LABELS = ['Fetch', 'Worktree', 'PM', 'Dev', 'Commit', 'Format', 'Push', 'Review'];
+
+// --- Tab switching ---
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  if (name === 'history') loadHistory();
+}
+
+// --- SSE connection ---
+let evtSource = null;
+function connectSSE() {
+  evtSource = new EventSource('/events');
+
+  evtSource.onopen = () => {
+    document.getElementById('statusDot').className = 'dot online';
+    document.getElementById('statusText').textContent = 'Connected';
+  };
+
+  evtSource.onerror = () => {
+    document.getElementById('statusDot').className = 'dot offline';
+    document.getElementById('statusText').textContent = 'Reconnecting...';
+  };
+
+  evtSource.addEventListener('reset', () => {
+    fetchStatus();
+  });
+
+  evtSource.addEventListener('job:start', (e) => {
+    const data = JSON.parse(e.data);
+    currentJob = { ticketId: data.ticketId, type: data.type, step: null, startedAt: data.ts };
+    updateJobUI();
+    clearLogs();
+    addLogLine('start', `Job started: ${data.ticketId} (${data.type})`);
+  });
+
+  evtSource.addEventListener('job:step', (e) => {
+    const data = JSON.parse(e.data);
+    if (currentJob && currentJob.ticketId === data.ticketId) {
+      currentJob.step = data.step;
+      updateJobUI();
+    }
+    addLogLine('step', `Step: ${data.step}`);
+  });
+
+  evtSource.addEventListener('job:log', (e) => {
+    const data = JSON.parse(e.data);
+    addLogLine(data.source || 'stdout', data.message);
+  });
+
+  evtSource.addEventListener('job:complete', (e) => {
+    const data = JSON.parse(e.data);
+    addLogLine('step', `Job complete: ${data.ticketId} (${data.outcome})${data.prUrl ? ' PR: ' + data.prUrl : ''}`);
+    currentJob = null;
+    updateJobUI();
+    hideError();
+  });
+
+  evtSource.addEventListener('job:error', (e) => {
+    const data = JSON.parse(e.data);
+    addLogLine('stderr', `ERROR: ${data.error}`);
+    showError(data.error);
+    currentJob = null;
+    updateJobUI();
+  });
+
+  evtSource.addEventListener('queue:update', (e) => {
+    const data = JSON.parse(e.data);
+    document.getElementById('queueSize').textContent = data.size || 0;
+  });
+
+  evtSource.addEventListener('approval:pending', (e) => {
+    const data = JSON.parse(e.data);
+    const el = document.getElementById('approvalCount');
+    el.textContent = parseInt(el.textContent) + 1;
+    addLogLine('step', `Approval pending: ${data.ticketId}`);
+  });
+
+  evtSource.addEventListener('approval:resolved', (e) => {
+    const data = JSON.parse(e.data);
+    const el = document.getElementById('approvalCount');
+    el.textContent = Math.max(0, parseInt(el.textContent) - 1);
+    addLogLine('step', `Approval resolved: ${data.ticketId} (${data.decision})`);
+  });
+}
+
+// --- Fetch initial status ---
+async function fetchStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    document.getElementById('activeCount').textContent = data.activeJobs ? data.activeJobs.length : 0;
+    document.getElementById('activeLabel').textContent = data.activeJobs && data.activeJobs.length > 0
+      ? data.activeJobs.map(j => j.ticketId).join(', ')
+      : 'Idle';
+    document.getElementById('queueSize').textContent = data.queueSize || 0;
+    document.getElementById('approvalCount').textContent = data.pendingApprovals ? data.pendingApprovals.length : 0;
+  } catch (_) {}
+}
+
+// --- Job UI ---
+function updateJobUI() {
+  const section = document.getElementById('currentJobSection');
+  if (!currentJob) {
+    section.style.display = 'none';
+    document.getElementById('activeCount').textContent = '0';
+    document.getElementById('activeLabel').textContent = 'Idle';
+    return;
+  }
+  section.style.display = 'block';
+  document.getElementById('jobTicketId').textContent = currentJob.ticketId;
+  document.getElementById('jobType').textContent = currentJob.type.toUpperCase();
+  document.getElementById('activeCount').textContent = '1';
+  document.getElementById('activeLabel').textContent = currentJob.ticketId;
+  if (currentJob.startedAt) {
+    document.getElementById('jobMeta').textContent = 'Started ' + new Date(currentJob.startedAt).toLocaleTimeString();
+  }
+
+  // Progress bar
+  const stepsEl = document.getElementById('progressSteps');
+  const labelsEl = document.getElementById('stepLabels');
+  const currentIdx = STEP_ORDER.indexOf(currentJob.step);
+  stepsEl.innerHTML = STEP_ORDER.map((_, i) => {
+    const cls = i < currentIdx ? 'step done' : (i === currentIdx ? 'step active' : 'step');
+    return `<div class="${cls}"></div>`;
+  }).join('');
+  labelsEl.innerHTML = STEP_LABELS.map((label, i) => {
+    const cls = i === currentIdx ? 'active-label' : '';
+    return `<span class="${cls}">${label}</span>`;
+  }).join('');
+}
+
+// --- Logs ---
+function clearLogs() {
+  const panel = document.getElementById('logPanel');
+  panel.innerHTML = '';
+  document.getElementById('logEmpty')?.remove();
+}
+
+function addLogLine(source, message) {
+  const panel = document.getElementById('logPanel');
+  const empty = document.getElementById('logEmpty');
+  if (empty) empty.remove();
+
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  const ts = new Date().toLocaleTimeString();
+  const srcClass = source === 'stderr' ? 'src-stderr' : (source === 'step' ? 'src-step' : 'src-stdout');
+  line.innerHTML = `<span class="ts">${ts}</span> <span class="${srcClass}">[${source}]</span> ${escapeHtml(message)}`;
+  panel.appendChild(line);
+
+  // Auto-scroll unless paused
+  if (!logPaused) {
+    panel.scrollTop = panel.scrollHeight;
+  }
+
+  // Cap log lines in DOM
+  while (panel.children.length > 500) {
+    panel.removeChild(panel.firstChild);
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Pause auto-scroll on hover
+const logPanel = document.getElementById('logPanel');
+logPanel.addEventListener('mouseenter', () => { logPaused = true; });
+logPanel.addEventListener('mouseleave', () => { logPaused = false; });
+
+// --- Error banner ---
+function showError(msg) {
+  const banner = document.getElementById('errorBanner');
+  banner.textContent = msg;
+  banner.classList.add('visible');
+}
+function hideError() {
+  document.getElementById('errorBanner').classList.remove('visible');
+}
+
+// --- History ---
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/history?limit=50');
+    const jobs = await res.json();
+    const container = document.getElementById('historyContent');
+
+    if (!jobs || jobs.length === 0) {
+      container.innerHTML = '<div class="empty-state"><div class="icon">~</div>No job history yet.</div>';
+      return;
+    }
+
+    let html = `<table class="history-table">
+      <thead><tr>
+        <th>Ticket</th><th>Type</th><th>Status</th><th>Duration</th><th>PR</th><th>Time</th>
+      </tr></thead><tbody>`;
+
+    for (const job of jobs) {
+      const statusClass = job.status === 'running' ? 'running' : (job.status === 'failed' ? 'failed' : (job.status === 'cancelled' ? 'cancelled' : 'success'));
+      const duration = job.completedAt && job.startedAt
+        ? formatDuration(new Date(job.completedAt) - new Date(job.startedAt))
+        : (job.status === 'running' ? '...' : '-');
+      const prLink = job.prUrl ? `<a href="${escapeHtml(job.prUrl)}" target="_blank">${escapeHtml(job.prUrl.split('/').pop())}</a>` : '-';
+      const time = new Date(job.startedAt).toLocaleString();
+
+      html += `<tr>
+        <td style="font-weight:600;">${escapeHtml(job.ticketId)}</td>
+        <td>${escapeHtml(job.type)}</td>
+        <td><span class="status-badge ${statusClass}">${escapeHtml(job.status)}</span></td>
+        <td>${duration}</td>
+        <td>${prLink}</td>
+        <td>${time}</td>
+      </tr>`;
+    }
+
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch (err) {
+    document.getElementById('historyContent').innerHTML =
+      `<div class="empty-state"><div class="icon">!</div>Failed to load history: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m + 'm ' + sec + 's';
+}
+
+// --- Init ---
+fetchStatus();
+connectSSE();
+</script>
+</body>
+</html>

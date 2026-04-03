@@ -3,14 +3,20 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node agent.js"
+    "start": "node agent.js",
+    "test": "vitest run"
   },
   "dependencies": {
     "@slack/bolt": "^3.17.0",
+    "better-sqlite3": "^12.8.0",
     "dotenv": "^16.4.5",
+    "express": "^5.2.1",
     "p-queue": "^6.6.2"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.2"
   }
 }
