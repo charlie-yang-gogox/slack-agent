@@ -18,6 +18,8 @@ const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
 const JOB_TIMEOUT_MS = 60 * 60 * 1000;
 const DEDUP_TTL_MS = 10 * 60 * 1000;
 
+const ORIGINAL_PROJECT_PATH = process.env.ORIGINAL_PROJECT_PATH || "";
+
 const FETCH_TICKET_PY = path.join(__dirname, "fetch_ticket.py");
 const BUILD_PROMPT_PY = path.join(__dirname, "build_prompt.py");
 const LINEAR_UPDATE_PY = path.join(__dirname, "linear_update.py");
@@ -224,9 +226,136 @@ function slugify(text) {
   return text.toLowerCase().replace(/[^a-z0-9\s-]/g, "").replace(/[\s]+/g, "-").trim();
 }
 
+// --- Port: Explore original project ---
+async function runExplore(ticketId, worktreePath) {
+  const ticketPath = `/tmp/ticket-${ticketId}.json`;
+  const ticket = JSON.parse(fs.readFileSync(ticketPath, "utf8"));
+
+  const explorePrompt = `You are scanning an original project to document a specific feature for porting.
+
+Original project path: ${ORIGINAL_PROJECT_PATH}
+Feature to find: ${ticket.title}
+
+Ticket context:
+${ticket.description || "(no description)"}
+
+Explore the codebase thoroughly and produce a structured markdown report. Keep the report HIGH-LEVEL — focus on WHAT the feature does and its rules, NOT how the original project implements it internally.
+
+## Feature Overview
+Brief summary of what the feature does from a user perspective. 2-3 sentences max.
+
+## User-Facing Behavior
+Describe the feature from the user's perspective: what they see, what they interact with, what happens on success/failure. Use plain language, not code references.
+
+## Business Rules
+Numbered list of every rule, validation, and edge case. Be exhaustive. These rules should be implementation-agnostic — describe WHAT must be true, not HOW the original code achieves it.
+
+## Data Models
+Key data structures with field names and types. Include class/model/enum definitions as reference material. Only include models directly relevant to this feature.
+
+## API / Service Contracts
+API endpoints, request/response shapes, status codes, and error conditions. This is critical for the port — be precise.
+
+## UI States & Flows
+High-level description of screens involved, navigation flow between them, and key UI states (loading, error, empty, success). Do NOT list original project file paths or widget class names — describe what the user sees.
+
+IMPORTANT:
+- Do NOT list original project file paths, class names, or architecture patterns
+- Do NOT describe state management implementation details
+- Do NOT include raw business logic code — describe the rules in plain language instead
+- Code is ONLY allowed for: data model definitions, API request/response shapes
+- Focus on WHAT and WHY, never HOW the original implements it`;
+
+  const output = await runAsync(
+    CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-explore`],
+    { input: explorePrompt, cwd: ORIGINAL_PROJECT_PATH, env: { ...process.env }, timeout: CLAUDE_TIMEOUT_MS, ticketId: `${ticketId}:explore` }
+  );
+
+  const cleaned = cleanAgentOutput(output.trim());
+  if (!cleaned || cleaned.length < 50) {
+    throw new Error("Explore agent produced insufficient output");
+  }
+
+  // Cache to worktree for retry resilience + port detection
+  const cachePath = path.join(worktreePath, "openspec", "changes");
+  fs.mkdirSync(cachePath, { recursive: true });
+  const cacheFile = path.join(cachePath, "port-source-analysis.md");
+  fs.writeFileSync(cacheFile, cleaned, "utf8");
+
+  return cleaned;
+}
+
+// --- Port: Upsert Linear comment with HTML markers (same format as flutter /port skill) ---
+const LINEAR_API_KEY = process.env.LINEAR_API_KEY;
+const PORT_COMMENT_ID_FILE = "port-linear-comment-id.txt";
+
+async function getLinearIssueUuid(ticketId) {
+  const query = `query { issueSearch(filter: { identifier: { eq: "${ticketId}" } }) { nodes { id } } }`;
+  const res = await fetch("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: LINEAR_API_KEY },
+    body: JSON.stringify({ query }),
+  });
+  const data = await res.json();
+  return data?.data?.issueSearch?.nodes?.[0]?.id || null;
+}
+
+function composePortCommentBody(artifacts) {
+  let body = `## Port Source Analysis\n<!-- PORT:SOURCE_ANALYSIS:START -->\n${artifacts.sourceAnalysis}\n<!-- PORT:SOURCE_ANALYSIS:END -->\n\n---\n\n`;
+  body += `## Port PRD\n<!-- PORT:PRD:START -->\n${artifacts.prd}\n<!-- PORT:PRD:END -->\n`;
+  if (artifacts.design) {
+    body += `\n---\n\n## Port Design Changed\n<!-- PORT:DESIGN_CHANGED:START -->\n${artifacts.design}\n<!-- PORT:DESIGN_CHANGED:END -->\n`;
+  }
+  const now = new Date().toISOString().slice(0, 16).replace("T", " ");
+  body += `\n---\n\n_Posted: ${now} by Slack PM Agent_`;
+  return body;
+}
+
+async function upsertPortComment(ticketId, worktreePath, artifacts) {
+  const commentIdPath = path.join(worktreePath, PORT_COMMENT_ID_FILE);
+  const existingCommentId = fs.existsSync(commentIdPath) ? fs.readFileSync(commentIdPath, "utf8").trim() : null;
+  const body = composePortCommentBody(artifacts);
+
+  if (existingCommentId) {
+    const mutation = `mutation { commentUpdate(id: "${existingCommentId}", input: { body: ${JSON.stringify(body)} }) { success } }`;
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: LINEAR_API_KEY },
+      body: JSON.stringify({ query: mutation }),
+    });
+    const data = await res.json();
+    if (data?.data?.commentUpdate?.success) {
+      console.log(`[${ticketId}] Port comment updated on Linear`);
+    } else {
+      console.error(`[${ticketId}] Failed to update Linear comment:`, JSON.stringify(data));
+    }
+  } else {
+    const issueUuid = await getLinearIssueUuid(ticketId);
+    if (!issueUuid) {
+      console.error(`[${ticketId}] Could not find Linear issue UUID`);
+      return;
+    }
+    const mutation = `mutation { commentCreate(input: { issueId: "${issueUuid}", body: ${JSON.stringify(body)} }) { success comment { id } } }`;
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: LINEAR_API_KEY },
+      body: JSON.stringify({ query: mutation }),
+    });
+    const data = await res.json();
+    if (data?.data?.commentCreate?.success) {
+      const commentId = data.data.commentCreate.comment.id;
+      fs.writeFileSync(commentIdPath, commentId, "utf8");
+      console.log(`[${ticketId}] Port comment created on Linear (id: ${commentId})`);
+    } else {
+      console.error(`[${ticketId}] Failed to create Linear comment:`, JSON.stringify(data));
+    }
+  }
+}
+
 // Three-step PM phase: pm-agent + designer-agent (parallel, cached) → orchestrator /opsx:ff
 // Cache is managed by agent.js, not by Claude
-async function runPMPhase(ticketId, worktreePath, channelId, threadTs) {
+async function runPMPhase(ticketId, worktreePath, channelId, threadTs, opts = {}) {
+  const { sourceAnalysis = null } = opts;
   const ticketContext = buildTicketContext(ticketId, worktreePath);
   const ticketPath = `/tmp/ticket-${ticketId}.json`;
   const ticket = JSON.parse(fs.readFileSync(ticketPath, "utf8"));
@@ -251,7 +380,14 @@ async function runPMPhase(ticketId, worktreePath, channelId, threadTs) {
 
   const runAndValidate = async (agentName, cachePath, sessionSuffix) => {
     const agentDef = readAgentDef(agentName);
-    const prompt = `${agentDef}\n\n---\n\n${ticketContext}\n\nOutput your full result as markdown to stdout. Do NOT use the Write tool or attempt to write files.`;
+    let prompt = `${agentDef}\n\n---\n\n${ticketContext}`;
+    if (sourceAnalysis && agentName === "pm-agent") {
+      prompt += `\n\n## Source Analysis (from original project)\n\n${sourceAnalysis}\n\nThis is a PORT — adapt requirements from the original project. Do NOT include source code (except data model definitions). Only describe requirements and approach.`;
+    }
+    if (sourceAnalysis && agentName === "designer-agent") {
+      prompt += `\n\n## Source Analysis (from original project)\n\n${sourceAnalysis}\n\nThis is a PORT — identify UI/design changes needed when porting this feature.`;
+    }
+    prompt += `\n\nOutput your full result as markdown to stdout. Do NOT use the Write tool or attempt to write files.`;
     const output = await runAsync(
       CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--model", "sonnet", "--name", `${ticketId}-${sessionSuffix}`],
       { input: prompt,
@@ -307,7 +443,7 @@ async function runPMPhase(ticketId, worktreePath, channelId, threadTs) {
 
   // Step 3: Orchestrator runs /opsx:ff with combined context
   console.log(`[${ticketId}] Starting orchestrator (/opsx:ff)...`);
-  const orchestratorPrompt = `${ticketContext}
+  let orchestratorPrompt = `${ticketContext}
 
 ## PRD (from PM agent)
 
@@ -316,7 +452,20 @@ ${prdContent}
 ## Design Guidance (from Designer agent)
 
 ${designContent}
+`;
 
+  if (sourceAnalysis) {
+    orchestratorPrompt += `
+## Source Analysis (from original project)
+
+This is a PORT from an existing project. The source analysis below describes the original feature.
+Do NOT copy source code. Use it as context for understanding requirements and data models.
+
+${sourceAnalysis}
+`;
+  }
+
+  orchestratorPrompt += `
 ## Your task
 
 Run \`/opsx:ff ${titleSlug}\` — incorporate the PRD and design guidance above as context.
@@ -507,6 +656,8 @@ pmApp.event("app_mention", async ({ event, client }) => {
 
   const prdMatch = text.match(/^prd\s+([A-Z]+-\d+)$/i);
   const ffMatch = text.match(/^ff\s+([A-Z]+-\d+)(?:\s*:\s*([\s\S]+))?$/i);
+  const portMatch = text.match(/^port\s+([A-Z]+-\d+)$/i);
+  const portffMatch = text.match(/^portff\s+([A-Z]+-\d+)(?:\s*:\s*([\s\S]+))?$/i);
   const cancelMatch = text.match(/^cancel\s+([A-Z]+-\d+)$/i);
   const isUpdate = /^update/i.test(text);
 
@@ -637,6 +788,123 @@ pmApp.event("app_mention", async ({ event, client }) => {
       }
     });
 
+  } else if (portMatch || portffMatch) {
+    const isPortFF = !!portffMatch;
+    const ticketId = (portMatch || portffMatch)[1].toUpperCase();
+    const extraInstructions = isPortFF && portffMatch[2] ? portffMatch[2].trim() : null;
+
+    if (!ORIGINAL_PROJECT_PATH) {
+      await postThread(client, channelId, threadTs, "`ORIGINAL_PROJECT_PATH` not set in .env — required for port commands.");
+      return;
+    }
+
+    const emoji = isPortFF ? "rocket" : "ship";
+    try { await client.reactions.add({ channel: channelId, timestamp: messageTs, name: emoji }); } catch (_) {}
+    const modeLabel = isPortFF ? "Port-FF" : "Port";
+    await postThread(client, channelId, threadTs, `${modeLabel} mode: exploring original project + generating artifacts for \`${ticketId}\`...`);
+
+    queue.add(async () => {
+      let worktreePath, branch;
+      try {
+        // Fetch ticket
+        run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+
+        // Create or reuse worktree
+        ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
+
+        // Check if artifacts already exist
+        const changesDir = path.join(worktreePath, "openspec", "changes");
+        const { hasArtifacts, dirs: existingArtifacts } = checkArtifacts(changesDir);
+
+        if (hasArtifacts) {
+          await postThread(client, channelId, threadTs,
+            `OpenSpec artifacts already exist: \`${existingArtifacts.join("`, `")}\`\nSkipping generation.`
+          );
+        } else {
+          if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+
+          // Step 1: Explore original project
+          const saCache = path.join(changesDir, "port-source-analysis.md");
+          let sourceAnalysis;
+          if (fs.existsSync(saCache) && fs.readFileSync(saCache, "utf8").trim().length >= 50) {
+            console.log(`[${ticketId}] Source analysis cached, skipping explore`);
+            sourceAnalysis = fs.readFileSync(saCache, "utf8").trim();
+          } else {
+            await postThread(client, channelId, threadTs, `Exploring original project at \`${ORIGINAL_PROJECT_PATH}\`...`);
+            sourceAnalysis = await runExplore(ticketId, worktreePath);
+            safetyCommit(worktreePath, ticketId, "post-explore");
+          }
+
+          if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+
+          // Step 2: PM + Designer + /opsx:ff (with source analysis injected)
+          await postThread(client, channelId, threadTs, `PM + Designer agents working on \`${branch}\`...`);
+          await runPMPhase(ticketId, worktreePath, channelId, threadTs, { sourceAnalysis });
+
+          // Commit + push
+          spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+          spawnSync("git", ["commit", "-m", `chore: add port artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+          run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+        }
+
+        // Post artifacts to Slack
+        const changesDir2 = path.join(worktreePath, "openspec", "changes");
+        await postArtifactsToSlack(changesDir2, client, channelId, threadTs);
+
+        // Post source analysis to Slack too
+        const saPath = path.join(changesDir2, "port-source-analysis.md");
+        if (fs.existsSync(saPath)) {
+          const saContent = fs.readFileSync(saPath, "utf8").trim();
+          const header = `*port-source-analysis.md*`;
+          for (let i = 0; i < saContent.length; i += 3000) {
+            const chunk = i === 0 ? `${header}\n\`\`\`\n${saContent.slice(i, i + 3000)}\n\`\`\`` : `\`\`\`\n${saContent.slice(i, i + 3000)}\n\`\`\``;
+            await postThread(client, channelId, threadTs, chunk);
+          }
+        }
+
+        // Upsert Linear comment with HTML markers
+        const ticketPath = `/tmp/ticket-${ticketId}.json`;
+        const ticket = JSON.parse(fs.readFileSync(ticketPath, "utf8"));
+        const titleSlug = slugify(ticket.title);
+        const artifactDir = path.join(changesDir2, titleSlug);
+        const prdPath = path.join(artifactDir, "prd.md");
+        const designPath = path.join(artifactDir, "design-guidance.md");
+
+        await upsertPortComment(ticketId, worktreePath, {
+          sourceAnalysis: fs.existsSync(saPath) ? fs.readFileSync(saPath, "utf8").trim() : "",
+          prd: fs.existsSync(prdPath) ? fs.readFileSync(prdPath, "utf8").trim() : "",
+          design: fs.existsSync(designPath) ? fs.readFileSync(designPath, "utf8").trim() : null,
+        });
+
+        if (isPortFF) {
+          // Hand off to Dev
+          ffTickets.add(ticketId);
+          if (extraInstructions) ffTicketExtras.set(ticketId, extraInstructions);
+          await postThread(client, channelId, threadTs, `<@${devBotUserId}> dev ${ticketId}`);
+        } else {
+          await postThread(client, channelId, threadTs,
+            `<@${requesterId}> Port analysis for \`${ticketId}\` complete!\n\n` +
+            `Artifacts posted to Linear + Slack.\n\n` +
+            `*Next steps:*\n` +
+            `• Leave feedback + \`update\` — PM Bot revises the specs\n` +
+            `• \`dev ${ticketId}\` — Dev Agent starts implementation\n` +
+            `• \`portff ${ticketId}\` — full auto port + dev + PR`
+          );
+        }
+      } catch (err) {
+        if (cancelledTickets.has(ticketId)) {
+          console.log(`[${modeLabel} ${ticketId}] cancelled.`);
+          if (isPortFF) { ffTickets.delete(ticketId); ffTicketExtras.delete(ticketId); }
+          return;
+        }
+        console.error(`[${modeLabel} ${ticketId}] failed:`, err.message);
+        if (isPortFF) { ffTickets.delete(ticketId); ffTicketExtras.delete(ticketId); }
+        await postThread(client, channelId, threadTs, `${modeLabel} failed: ${err.message}`);
+      } finally {
+        cancelledTickets.delete(ticketId);
+      }
+    });
+
   } else if (isUpdate) {
     if (!event.thread_ts) return;
 
@@ -691,6 +959,23 @@ pmApp.event("app_mention", async ({ event, client }) => {
         spawnSync("git", ["add", "-A"], { cwd: workDir, encoding: "utf8" });
         spawnSync("git", ["commit", "-m", `chore: revise openspec artifacts for ${ticketId}`], { cwd: workDir, encoding: "utf8" });
         spawnSync("git", ["push", "origin", branch], { cwd: workDir, encoding: "utf8" });
+
+        // If this is a port ticket, sync updated artifacts to Linear
+        const saPath = path.join(workDir, "openspec", "changes", "port-source-analysis.md");
+        if (fs.existsSync(saPath)) {
+          const changeDirsForPort = fs.readdirSync(changesDir)
+            .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
+          for (const dir of changeDirsForPort) {
+            const prdPath = path.join(changesDir, dir, "prd.md");
+            const designPath = path.join(changesDir, dir, "design-guidance.md");
+            await upsertPortComment(ticketId, workDir, {
+              sourceAnalysis: fs.readFileSync(saPath, "utf8").trim(),
+              prd: fs.existsSync(prdPath) ? fs.readFileSync(prdPath, "utf8").trim() : "",
+              design: fs.existsSync(designPath) ? fs.readFileSync(designPath, "utf8").trim() : null,
+            });
+          }
+          await postThread(client, channelId, threadTs, "Updated artifacts also synced to Linear.");
+        }
 
         await postThread(client, channelId, threadTs,
           `Specs revised and pushed to \`${branch}\`!\n` +
