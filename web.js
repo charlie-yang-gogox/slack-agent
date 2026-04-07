@@ -292,6 +292,32 @@ app.post("/api/jobs/dev", (req, res) => {
   }
 });
 
+// Trigger Port
+app.post("/api/jobs/port", (req, res) => {
+  try {
+    const { ticketId } = req.body || {};
+    if (!ticketId) return res.status(422).json({ error: "ticketId is required" });
+    const result = getAgent().triggerPort(ticketId.toUpperCase());
+    if (!result.ok) return res.status(409).json({ error: result.error });
+    res.status(202).json({ ticketId: ticketId.toUpperCase(), status: "queued" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Trigger PortFF
+app.post("/api/jobs/portff", (req, res) => {
+  try {
+    const { ticketId, instructions } = req.body || {};
+    if (!ticketId) return res.status(422).json({ error: "ticketId is required" });
+    const result = getAgent().triggerPortFF(ticketId.toUpperCase(), instructions);
+    if (!result.ok) return res.status(409).json({ error: result.error });
+    res.status(202).json({ ticketId: ticketId.toUpperCase(), status: "queued" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Trigger PRD
 app.post("/api/jobs/prd", (req, res) => {
   try {

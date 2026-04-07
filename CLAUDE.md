@@ -20,6 +20,9 @@ A Slack-based auto development agent that orchestrates PM and Dev workflows via 
 | `@PM ff TICKET-ID` | PM | Full auto: PRD → artifacts → hand off to Dev → PR |
 | `@PM ff TICKET-ID: <instructions>` | PM | FF with extra instructions for Dev |
 | `@PM update <feedback>` (in thread) | PM | Revise artifacts based on feedback |
+| `@PM port TICKET-ID` | PM | Explore original project → PRD + OpenSpec → post Linear |
+| `@PM portff TICKET-ID` | PM | Port full auto: explore → artifacts → Dev → PR |
+| `@PM portff TICKET-ID: <instructions>` | PM | Portff with extra Dev instructions |
 | `@PM cancel TICKET-ID` | PM | Kill running PM job |
 | `@Dev dev TICKET-ID` | Dev | Start implementation using artifacts |
 | `@Dev TICKET-ID` | Dev | Direct dev flow (generates artifacts if none exist) |
@@ -114,7 +117,7 @@ agent.js (Slack bots + job logic + state)
     │
     ├─ registerStatusProvider()  → getStatus() returns read-only snapshot
     │
-    └─ module.exports { triggerFF, triggerDev, triggerPRD, cancelJob, resolveApproval }
+    └─ module.exports { triggerFF, triggerDev, triggerPRD, triggerPort, triggerPortFF, cancelJob, resolveApproval }
         ↑ called by web.js POST endpoints
 ```
 
@@ -153,6 +156,8 @@ Web POST /api/jobs/ff ─┘        │
 | `/api/jobs/ff` | POST | Trigger FF mode (returns 202) |
 | `/api/jobs/dev` | POST | Trigger Dev mode (returns 202) |
 | `/api/jobs/prd` | POST | Trigger PRD mode (returns 202) |
+| `/api/jobs/port` | POST | Trigger Port mode (returns 202) |
+| `/api/jobs/portff` | POST | Trigger PortFF mode (returns 202) |
 | `/api/jobs/cancel` | POST | Cancel running job |
 | `/api/approvals/:ticketId/approve` | POST | Approve with optional instructions |
 | `/api/approvals/:ticketId/reject` | POST | Reject |
