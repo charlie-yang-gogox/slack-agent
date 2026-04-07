@@ -242,25 +242,16 @@ async function runPMPhase(ticketId, worktreePath, channelId, threadTs) {
   const runAndValidate = async (agentName, cachePath, sessionSuffix) => {
     const output = await runAsync(
       CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--agent", agentName, "--name", `${ticketId}-${sessionSuffix}`],
-      { input: `${ticketContext}\n\nSave output to: \`${cachePath}\``,
+      { input: `${ticketContext}\n\nOutput your full result to stdout. Do NOT use the Write tool or attempt to write files.`,
         cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
     );
-    // Check if Claude wrote a valid file; fallback to cleaned stdout
-    const fileContent = fs.existsSync(cachePath) ? fs.readFileSync(cachePath, "utf8").trim() : "";
-    const rawOutput = output.trim();
-    console.log(`[${ticketId}] ${agentName}: file=${fileContent.length}chars, stdout=${rawOutput.length}chars`);
-    let content;
-    if (validateAgentOutput(fileContent)) {
-      content = cleanAgentOutput(fileContent);
-    } else {
-      content = cleanAgentOutput(rawOutput);
-    }
-    console.log(`[${ticketId}] ${agentName}: cleaned=${content.length}chars`);
+    // Capture stdout and write to cache ourselves
+    const content = cleanAgentOutput(output.trim());
+    console.log(`[${ticketId}] ${agentName}: stdout=${output.trim().length}chars, cleaned=${content.length}chars`);
     if (!content || content.length < 10) {
       console.error(`[${ticketId}] ${agentName} output failed validation (empty after cleaning)`);
       return false;
     }
-    // Always write cleaned content to ensure cache is valid
     fs.writeFileSync(cachePath, content, "utf8");
     console.log(`[${ticketId}] ${agentName} done → ${cachePath}`);
     return true;
