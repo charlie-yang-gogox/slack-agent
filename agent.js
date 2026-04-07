@@ -243,7 +243,7 @@ async function runPMPhase(ticketId, worktreePath, channelId, threadTs) {
     const output = await runAsync(
       CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--agent", agentName, "--name", `${ticketId}-${sessionSuffix}`],
       { input: `${ticketContext}\n\nSave output to: \`${cachePath}\``,
-        cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId: `${ticketId}:${sessionSuffix}` }
+        cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
     );
     // Check if Claude wrote a valid file; fallback to cleaned stdout
     const fileContent = fs.existsSync(cachePath) ? fs.readFileSync(cachePath, "utf8").trim() : "";
@@ -778,9 +778,15 @@ devApp.event("app_mention", async ({ event, client }) => {
 
     recentTickets.set(ticketId, Date.now());
 
-    // Fetch thread context if triggered from an existing thread (e.g., PM thread)
+    const isFF = ffTickets.has(ticketId);
+
+    // Fetch thread context if triggered from an existing thread (skip in FF — artifacts are in worktree)
     let threadContext = "";
-    if (isFromThread) {
+    if (isFF) {
+      await postThread(client, channelId, threadTs,
+        `Queued \`${ticketId}\` — continuing from FF mode.`
+      );
+    } else if (isFromThread) {
       threadContext = await fetchThreadContext(client, channelId, threadTs);
       await postThread(client, channelId, threadTs,
         `Queued \`${ticketId}\` — incorporating thread context into development.`
@@ -791,7 +797,6 @@ devApp.event("app_mention", async ({ event, client }) => {
       );
     }
 
-    const isFF = ffTickets.has(ticketId);
     queue.add(() => runDevJob(ticketId, channelId, threadTs, client, threadContext, { isFF, isFromThread }));
 
   } else if (cancelMatch) {
@@ -811,10 +816,15 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
   let worktreePath, branch;
 
   try {
-    // Step 1: Fetch ticket + Linear update
+    // Step 1: Fetch ticket + Linear update (skip fetch if FF already has it)
     if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
-    await postThread(client, channelId, threadTs, `Fetching ticket \`${ticketId}\`...`);
-    run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+    const ticketCachePath = `/tmp/ticket-${ticketId}.json`;
+    if (opts.isFF && fs.existsSync(ticketCachePath)) {
+      await postThread(client, channelId, threadTs, `Ticket \`${ticketId}\` already fetched, updating Linear...`);
+    } else {
+      await postThread(client, channelId, threadTs, `Fetching ticket \`${ticketId}\`...`);
+      run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+    }
     run("python3", [LINEAR_UPDATE_PY, ticketId], { env: { ...process.env } });
 
     if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
@@ -836,22 +846,37 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     const { hasArtifacts, dirs: existing } = checkArtifacts(changesDir);
 
     if (hasArtifacts) {
-      await postThread(client, channelId, threadTs,
-        `OpenSpec artifacts already exist: \`${existing.join("`, `")}\`\n` +
-        `Skipping artifact generation.\nReply \`approve\` to start implementation, or \`reject\` to cancel.\nYou can also reply \`approve: <extra instructions>\`.`
-      );
+      if (opts.isFF) {
+        await postThread(client, channelId, threadTs,
+          `OpenSpec artifacts already exist: \`${existing.join("`, `")}\`\nSkipping artifact generation, starting implementation...`
+        );
+      } else {
+        await postThread(client, channelId, threadTs,
+          `OpenSpec artifacts already exist: \`${existing.join("`, `")}\`\n` +
+          `Skipping artifact generation.\nReply \`approve\` to start implementation, or \`reject\` to cancel.\nYou can also reply \`approve: <extra instructions>\`.`
+        );
+      }
     } else {
       await postThread(client, channelId, threadTs, `PM + Designer agents generating artifacts...`);
       await runPMPhase(ticketId, worktreePath, channelId, threadTs);
 
-      const ffOutput = "(artifacts generated)";
-
       if (jobTimedOut) throw new Error("Job timed out");
 
-      const ffSummary = ffOutput.trim().slice(-1500) || "(no output)";
-      await postThread(client, channelId, threadTs,
-        `Artifacts ready:\n\`\`\`\n${ffSummary}\n\`\`\`\nReply \`approve\` to start implementation, or \`reject\` to cancel.\nYou can also reply \`approve: <extra instructions>\`.`
-      );
+      // P6: Post full artifacts + commit/push so user can review before approving
+      if (!opts.isFF) {
+        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+        await postArtifactsToSlack(changesDir, client, channelId, threadTs);
+      }
+
+      if (opts.isFF) {
+        await postThread(client, channelId, threadTs, `Artifacts generated, starting implementation...`);
+      } else {
+        await postThread(client, channelId, threadTs,
+          `Artifacts ready! Review above, then reply \`approve\` to start implementation, or \`reject\` to cancel.\nYou can also reply \`approve: <extra instructions>\`.`
+        );
+      }
     }
 
     let approved, extra;
@@ -865,7 +890,6 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
         extra = ffExtra;
         ffTicketExtras.delete(ticketId);
       }
-      await postThread(client, channelId, threadTs, `Auto-approved (ff mode), starting implementation...`);
     } else {
       ({ approved, extra } = await waitForApproval(threadTs));
       if (!approved) {
@@ -891,7 +915,9 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
         try {
           let args;
           if (isResume) {
-            args = ["--print", "--dangerously-skip-permissions", "--model", "opus", "--resume", sessionName];
+            args = isAgent
+              ? ["--print", "--dangerously-skip-permissions", "--resume", sessionName]
+              : ["--print", "--dangerously-skip-permissions", "--model", "opus", "--resume", sessionName];
           } else if (isAgent) {
             args = ["--print", "--dangerously-skip-permissions", "--agent", label, "--name", sessionName];
           } else {
@@ -928,17 +954,32 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
       }
     };
 
-    // Build apply prompt with thread context + extra instructions
+    // Build apply prompt with extra instructions (FF: only user instructions; manual: thread context)
     let applyExtra = extra;
-    if (threadContext && !applyExtra) {
+    if (!opts.isFF && threadContext && !applyExtra) {
       applyExtra = `The following Slack thread context may contain relevant feedback:\n${threadContext}`;
-    } else if (threadContext && applyExtra) {
+    } else if (!opts.isFF && threadContext && applyExtra) {
       applyExtra = `${applyExtra}\n\nSlack thread context:\n${threadContext}`;
     }
 
     // Step 4b: dev-agent (opsx:apply + verify + test)
+    const { dirs: artifactDirs } = checkArtifacts(changesDir);
+    const artifactSlug = artifactDirs[0] || "";
     const devContext = buildTicketContext(ticketId, worktreePath, applyExtra);
-    await runSkill("dev-agent", devContext);
+    const devPrompt = `${devContext}
+
+## Your task
+
+Run \`/opsx:apply ${artifactSlug}\` to implement the changes described in the OpenSpec artifacts at \`openspec/changes/${artifactSlug}/\`.
+
+After applying, run \`/opsx:verify\` to validate the implementation.
+Then run any relevant tests.
+
+Stage and commit all changes before finishing.
+
+You have FULL write permissions to ALL directories including \`openspec/\`, \`lib/\`, and \`test/\`. Do NOT ask for permission — just execute tools directly. All permission checks are bypassed.
+`;
+    await runSkill("dev-agent", devPrompt);
     safetyCommit(worktreePath, ticketId, "after opsx:apply");
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
@@ -992,7 +1033,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     const sessionId = getLatestSessionId();
     if (sessionId) {
       await postThread(client, channelId, threadTs,
-        `To continue in terminal:\n\`\`\`\ncd ${worktreePath}\nclaude --resume ${ticketId}\n\`\`\`\nAll sessions: \`${ticketId}-ff\`, \`${ticketId}-opsx:apply\`, \`${ticketId}-commit\`, \`${ticketId}-format\`, \`${ticketId}-code-review\``
+        `To continue in terminal:\n\`\`\`\ncd ${worktreePath}\nclaude --resume ${ticketId}-dev-agent\n\`\`\`\nAll sessions: \`${ticketId}-dev-agent\`, \`${ticketId}-commit\`, \`${ticketId}-format\`, \`${ticketId}-code-review\``
       );
     }
   } catch (err) {
