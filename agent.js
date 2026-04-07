@@ -238,11 +238,23 @@ async function runPMPhase(ticketId, worktreePath, channelId, threadTs) {
   fs.mkdirSync(cacheDir, { recursive: true });
 
   // Step 1: Run pm-agent + designer-agent (skip if valid cache exists)
-  // Helper: run agent, validate output, write cache. Returns true if valid.
+  // Read agent definitions from target repo and inline as prompt context (no --agent flag).
+  // These agents only produce text — no tools needed, avoids permission issues.
+  const readAgentDef = (agentName) => {
+    const agentPath = path.join(REPO_ROOT, ".claude", "agents", `${agentName}.md`);
+    if (!fs.existsSync(agentPath)) {
+      console.warn(`[${ticketId}] Agent definition not found: ${agentPath}, using agentName as fallback`);
+      return `You are a ${agentName}. Produce your output as markdown.`;
+    }
+    return fs.readFileSync(agentPath, "utf8").trim();
+  };
+
   const runAndValidate = async (agentName, cachePath, sessionSuffix) => {
+    const agentDef = readAgentDef(agentName);
+    const prompt = `${agentDef}\n\n---\n\n${ticketContext}\n\nOutput your full result as markdown to stdout. Do NOT use the Write tool or attempt to write files.`;
     const output = await runAsync(
-      CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--agent", agentName, "--name", `${ticketId}-${sessionSuffix}`],
-      { input: `${ticketContext}\n\nOutput your full result to stdout. Do NOT use the Write tool or attempt to write files.`,
+      CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--model", "sonnet", "--name", `${ticketId}-${sessionSuffix}`],
+      { input: prompt,
         cwd: worktreePath, env: { ...process.env, GIT_WORK_TREE: worktreePath }, timeout: CLAUDE_TIMEOUT_MS, ticketId, threadTs, channelId }
     );
     // Capture stdout and write to cache ourselves
@@ -899,7 +911,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
       console.log(`[${ticketId}] Starting ${label}...`);
       await postThread(client, channelId, threadTs, `Running \`${label}\`...`);
       const sessionName = `${ticketId}-${label}`;
-      const isAgent = ["pm-agent", "dev-agent"].includes(label);
+      const isAgent = label === "dev-agent";
       let isResume = false;
 
       for (let attempt = 1; attempt <= retries + 1; attempt++) {
