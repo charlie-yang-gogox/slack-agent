@@ -228,7 +228,7 @@
 <script>
 // --- State ---
 const jobs = new Map(); // ticketId -> { ticketId, type, startedAt, steps: [{name, status, startedAt, completedAt}], currentStep, outcome, error, prUrl, recentLogs[] }
-const STEP_NAMES = { 'fetch-ticket': 'Fetch Ticket', 'worktree': 'Prepare Worktree', 'pm-agent': 'PM + Designer Agents', 'dev-agent': 'Dev Agent', 'commit': 'Commit', 'format': 'Format', 'push-pr': 'Push + Create PR', 'push-artifacts': 'Push Artifacts', 'code-review': 'Code Review' };
+const STEP_NAMES = { 'fetch-ticket': 'Fetch Ticket', 'worktree': 'Prepare Worktree', 'check-artifacts': 'Check Artifacts', 'pm-agent': 'PM + Designer Agents', 'dev-agent': 'Dev Agent', 'commit': 'Commit', 'format': 'Format', 'push-pr': 'Push + Create PR', 'push-artifacts': 'Push Artifacts', 'code-review': 'Code Review' };
 const MAX_RECENT_LOGS = 5;
 const MAX_FINISHED_TASKS = 10;
 

@@ -609,6 +609,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
         // Check if artifacts already exist (must have proposal.md to be considered complete)
+        agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
         const changesDir = path.join(worktreePath, "openspec", "changes");
         const { hasArtifacts, dirs: existingArtifacts } = checkArtifacts(changesDir);
 
@@ -683,6 +684,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
         // Check if artifacts already exist (must have proposal.md to be considered complete)
+        agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
         const changesDir = path.join(worktreePath, "openspec", "changes");
         const { hasArtifacts, dirs: existingArtifacts } = checkArtifacts(changesDir);
 
@@ -944,6 +946,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     if (jobTimedOut) throw new Error("Job timed out");
 
     // Step 3: Check if openspec artifacts already exist (must have proposal.md)
+    agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
     const changesDir = path.join(worktreePath, "openspec", "changes");
     const { hasArtifacts, dirs: existing } = checkArtifacts(changesDir);
 
@@ -1195,6 +1198,7 @@ function triggerFF(ticketId, instructions) {
       agentEvents.emit("job:step", { ticketId, step: "worktree" });
       ({ worktreePath, branch } = ensureWorktree(ticketId));
 
+      agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
       const changesDir = path.join(worktreePath, "openspec", "changes");
       const { hasArtifacts } = checkArtifacts(changesDir);
 
@@ -1244,6 +1248,7 @@ function triggerPRD(ticketId) {
       agentEvents.emit("job:step", { ticketId, step: "worktree" });
       ({ worktreePath, branch } = ensureWorktree(ticketId));
 
+      agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
       const changesDir = path.join(worktreePath, "openspec", "changes");
       const { hasArtifacts } = checkArtifacts(changesDir);
 
