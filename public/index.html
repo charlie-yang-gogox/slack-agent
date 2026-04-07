@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Slack Dev Agent</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace; background: #0d1117; color: #c9d1d9; font-size: 13px; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { font-size: 14px; font-weight: 600; color: #f0f6fc; letter-spacing: 0.5px; }
+  .header .status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #8b949e; }
+  .header .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.online { background: #3fb950; }
+  .dot.offline { background: #f85149; }
+
+  .tabs { display: flex; gap: 0; border-bottom: 1px solid #30363d; background: #161b22; }
+  .tab { padding: 10px 20px; cursor: pointer; border-bottom: 2px solid transparent; color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .tab:hover { color: #c9d1d9; }
+  .tab.active { color: #f0f6fc; border-bottom-color: #58a6ff; }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* Cards */
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 14px; }
+  .card h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin-bottom: 8px; }
+  .metric { font-size: 24px; font-weight: 700; color: #f0f6fc; }
+  .metric-label { font-size: 11px; color: #8b949e; margin-top: 2px; }
+
+  /* Timeline task card */
+  .task-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 12px; }
+  .task-card.running { border-color: #d29922; }
+  .task-card.success { border-color: #3fb95066; }
+  .task-card.failed { border-color: #f8514966; }
+  .task-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .ticket-id { font-size: 15px; font-weight: 700; color: #f0f6fc; }
+  .job-type { background: #1f6feb33; color: #58a6ff; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  .task-meta { font-size: 11px; color: #8b949e; }
+  .task-outcome { font-size: 12px; font-weight: 600; margin-top: 12px; padding: 8px 12px; border-radius: 4px; }
+  .task-outcome.success { background: #23863633; color: #3fb950; }
+  .task-outcome.failed { background: #f8514933; color: #f85149; }
+  .task-outcome.cancelled { background: #484f5833; color: #8b949e; }
+
+  /* Vertical timeline */
+  .timeline { position: relative; padding-left: 24px; }
+  .timeline::before { content: ''; position: absolute; left: 7px; top: 4px; bottom: 4px; width: 2px; background: #30363d; }
+  .tl-item { position: relative; padding: 0 0 16px 16px; }
+  .tl-item:last-child { padding-bottom: 0; }
+  .tl-dot { position: absolute; left: -20px; top: 2px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #30363d; background: #0d1117; }
+  .tl-item.done .tl-dot { background: #3fb950; border-color: #3fb950; }
+  .tl-item.active .tl-dot { background: #d29922; border-color: #d29922; animation: pulse 1.5s infinite; }
+  .tl-item.error .tl-dot { background: #f85149; border-color: #f85149; }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 #d2992244; } 50% { box-shadow: 0 0 0 4px #d2992244; } }
+  .tl-name { font-size: 12px; color: #f0f6fc; font-weight: 500; }
+  .tl-item.pending .tl-name { color: #484f58; }
+  .tl-time { font-size: 11px; color: #8b949e; margin-top: 2px; }
+  .tl-duration { color: #58a6ff; font-size: 11px; margin-left: 8px; }
+  .tl-logs { margin-top: 6px; padding: 6px 8px; background: #010409; border-radius: 4px; font-size: 11px; color: #8b949e; max-height: 80px; overflow-y: auto; line-height: 1.5; }
+  .tl-logs .log-warn { color: #d29922; }
+  .tl-error-msg { margin-top: 4px; font-size: 11px; color: #f85149; }
+
+  /* Inline card actions */
+  .card-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid #30363d; }
+  .card-actions .action-input { margin: 0; width: 180px; padding: 6px 8px; }
+  .card-actions .action-btn { padding: 6px 12px; font-size: 11px; }
+
+  /* New job form in Live tab */
+  .new-job-bar { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .new-job-bar .action-input { margin: 0; width: 140px; padding: 6px 8px; }
+  .new-job-bar .action-btn { padding: 6px 12px; font-size: 11px; }
+  .new-job-bar select { padding: 6px 8px; border: 1px solid #30363d; border-radius: 4px; font-family: inherit; font-size: 12px; background: #0d1117; color: #c9d1d9; }
+
+  .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; margin: 14px 0 8px; }
+
+  .empty-state { text-align: center; padding: 40px 20px; color: #484f58; }
+  .empty-state .icon { font-size: 32px; margin-bottom: 8px; }
+
+  /* History table */
+  .history-table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
+  .history-table th { background: #0d1117; text-align: left; padding: 10px 14px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #8b949e; border-bottom: 1px solid #30363d; }
+  .history-table td { padding: 10px 14px; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .history-table tr:hover { background: #1c2128; }
+  .status-badge { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  .status-badge.success { background: #23863633; color: #3fb950; }
+  .status-badge.running { background: #9e6a0333; color: #d29922; }
+  .status-badge.failed { background: #f8514933; color: #f85149; }
+  .status-badge.cancelled { background: #484f5833; color: #8b949e; }
+
+  /* Actions */
+  .action-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .action-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; }
+  .action-card h3 { font-size: 13px; font-weight: 600; color: #f0f6fc; margin-bottom: 4px; }
+  .action-card p { font-size: 12px; color: #8b949e; margin-bottom: 12px; }
+  .action-input { width: 100%; padding: 8px 10px; border: 1px solid #30363d; border-radius: 4px; font-family: inherit; font-size: 12px; background: #0d1117; color: #c9d1d9; margin-bottom: 8px; }
+  .action-input::placeholder { color: #484f58; }
+  .action-btn { padding: 8px 16px; border: none; border-radius: 4px; font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+  .action-btn.primary { background: #238636; color: #fff; }
+  .action-btn.primary:hover { background: #2ea043; }
+  .action-btn.danger { background: #f8514933; color: #f85149; border: 1px solid #f85149; }
+  .action-btn.danger:hover { background: #f8514966; }
+  .action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .action-result { font-size: 11px; margin-top: 8px; padding: 6px 8px; border-radius: 4px; display: none; }
+  .action-result.success { display: block; background: #23863633; color: #3fb950; }
+  .action-result.error { display: block; background: #f8514933; color: #f85149; }
+  .approval-item { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+  .approval-item .ticket { font-weight: 600; color: #f0f6fc; }
+  .approval-actions { display: flex; gap: 8px; align-items: center; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>SLACK DEV AGENT</h1>
+  <div class="status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">Connecting...</span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('live')">Live</div>
+  <div class="tab" onclick="switchTab('history')">History</div>
+  <div class="tab" onclick="switchTab('actions')">Actions</div>
+</div>
+
+<!-- LIVE TAB -->
+<div class="tab-content active" id="tab-live">
+  <div class="container">
+    <div class="grid" style="margin-top: 16px;">
+      <div class="card">
+        <h3>Active Jobs</h3>
+        <div class="metric" id="activeCount">0</div>
+        <div class="metric-label" id="activeLabel">Idle</div>
+      </div>
+      <div class="card">
+        <h3>Queue</h3>
+        <div class="metric" id="queueSize">0</div>
+        <div class="metric-label">pending</div>
+      </div>
+      <div class="card">
+        <h3>Approvals</h3>
+        <div class="metric" id="approvalCount">0</div>
+        <div class="metric-label">waiting</div>
+      </div>
+    </div>
+
+    <div class="new-job-bar">
+      <select id="newJobType">
+        <option value="ff">FF</option>
+        <option value="dev">Dev</option>
+        <option value="prd">PRD</option>
+        <option value="port">Port</option>
+        <option value="portff">PortFF</option>
+      </select>
+      <input class="action-input" type="text" id="newJobTicket" placeholder="Ticket ID" />
+      <input class="action-input" type="text" id="newJobInstructions" placeholder="Instructions (optional)" style="flex:1;min-width:120px;" />
+      <button class="action-btn primary" onclick="triggerNewJob()">Start</button>
+      <span id="newJobResult" style="font-size:11px;"></span>
+    </div>
+
+    <div id="taskTimeline">
+      <div class="empty-state" id="timelineEmpty">
+        <div class="icon">~</div>
+        No active tasks
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- HISTORY TAB -->
+<div class="tab-content" id="tab-history">
+  <div class="container" style="margin-top: 16px;">
+    <div id="historyContent">
+      <div class="empty-state">
+        <div class="icon">~</div>
+        Loading history...
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ACTIONS TAB -->
+<div class="tab-content" id="tab-actions">
+  <div class="container" style="margin-top: 16px;">
+    <div class="action-grid">
+      <div class="action-card">
+        <h3>Trigger FF</h3>
+        <p>Full auto: PRD, artifacts, implement, PR</p>
+        <input class="action-input" type="text" id="ffTicket" placeholder="CAF-123" />
+        <input class="action-input" type="text" id="ffInstructions" placeholder="Extra instructions (optional)" />
+        <button class="action-btn primary" onclick="triggerJob('ff')">Start FF</button>
+        <div class="action-result" id="ffResult"></div>
+      </div>
+      <div class="action-card">
+        <h3>Trigger Dev</h3>
+        <p>Start implementation using existing artifacts</p>
+        <input class="action-input" type="text" id="devTicket" placeholder="CAF-123" />
+        <button class="action-btn primary" onclick="triggerJob('dev')">Start Dev</button>
+        <div class="action-result" id="devResult"></div>
+      </div>
+      <div class="action-card">
+        <h3>Generate PRD</h3>
+        <p>Generate PRD + OpenSpec artifacts only</p>
+        <input class="action-input" type="text" id="prdTicket" placeholder="CAF-123" />
+        <button class="action-btn primary" onclick="triggerJob('prd')">Start PRD</button>
+        <div class="action-result" id="prdResult"></div>
+      </div>
+      <div class="action-card" style="border-color: #f8514966;">
+        <h3>Cancel Job</h3>
+        <p>Kill the running job for a ticket</p>
+        <input class="action-input" type="text" id="cancelTicket" placeholder="CAF-123" />
+        <button class="action-btn danger" onclick="cancelJobAction()">Cancel</button>
+        <div class="action-result" id="cancelResult"></div>
+      </div>
+    </div>
+
+    <div class="section-title" style="margin-top: 20px;">Pending Approvals</div>
+    <div id="approvalsList">
+      <div class="empty-state" style="padding: 20px;">No pending approvals</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// --- State ---
+const jobs = new Map(); // ticketId -> { ticketId, type, startedAt, steps: [{name, status, startedAt, completedAt}], currentStep, outcome, error, prUrl, recentLogs[] }
+const STEP_NAMES = { 'fetch-ticket': 'Fetch Ticket', 'worktree': 'Prepare Worktree', 'check-artifacts': 'Check Artifacts', 'explore': 'Explore Original Project', 'pm-agent': 'PM + Designer Agents', 'dev-agent': 'Dev Agent', 'commit': 'Commit', 'format': 'Format', 'push-pr': 'Push + Create PR', 'push-artifacts': 'Push Artifacts', 'code-review': 'Code Review', 'linear-post': 'Post to Linear' };
+const MAX_RECENT_LOGS = 5;
+const MAX_FINISHED_TASKS = 10;
+
+function getJob(ticketId) {
+  if (!jobs.has(ticketId)) {
+    jobs.set(ticketId, { ticketId, type: '?', startedAt: null, steps: [], currentStep: null, outcome: null, error: null, prUrl: null, recentLogs: [], waitingApproval: false });
+  }
+  return jobs.get(ticketId);
+}
+
+// --- Tab switching ---
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  if (name === 'history') loadHistory();
+}
+
+// --- SSE connection ---
+let evtSource = null;
+function connectSSE() {
+  evtSource = new EventSource('/events');
+
+  evtSource.onopen = () => {
+    document.getElementById('statusDot').className = 'dot online';
+    document.getElementById('statusText').textContent = 'Connected';
+  };
+
+  evtSource.onerror = () => {
+    document.getElementById('statusDot').className = 'dot offline';
+    document.getElementById('statusText').textContent = 'Reconnecting...';
+  };
+
+  evtSource.addEventListener('reset', () => { fetchStatus(); });
+
+  evtSource.addEventListener('job:start', (e) => {
+    const data = JSON.parse(e.data);
+    const job = getJob(data.ticketId);
+    job.type = data.type || 'dev';
+    job.startedAt = data.ts || new Date().toISOString();
+    job.steps = [];
+    job.currentStep = null;
+    job.outcome = null;
+    job.error = null;
+    job.prUrl = null;
+    job.recentLogs = [];
+    renderTimeline();
+  });
+
+  evtSource.addEventListener('job:step', (e) => {
+    const data = JSON.parse(e.data);
+    const job = getJob(data.ticketId);
+    const now = new Date().toISOString();
+    // Mark previous active step as done
+    if (job.currentStep) {
+      const prev = job.steps.find(s => s.name === job.currentStep);
+      if (prev && prev.status === 'active') {
+        prev.status = 'done';
+        prev.completedAt = now;
+      }
+    }
+    // Add new step
+    job.steps.push({ name: data.step, status: 'active', startedAt: now, completedAt: null });
+    job.currentStep = data.step;
+    job.recentLogs = []; // clear logs for new step
+    renderTimeline();
+  });
+
+  evtSource.addEventListener('job:log', (e) => {
+    const data = JSON.parse(e.data);
+    const job = getJob(data.ticketId);
+    job.recentLogs.push({ source: data.source, message: data.message, level: data.level });
+    if (job.recentLogs.length > MAX_RECENT_LOGS) job.recentLogs.shift();
+    renderTimelineLogOnly(data.ticketId);
+  });
+
+  evtSource.addEventListener('job:complete', (e) => {
+    const data = JSON.parse(e.data);
+    const job = getJob(data.ticketId);
+    const now = new Date().toISOString();
+    // Mark last active step as done
+    if (job.currentStep) {
+      const last = job.steps.find(s => s.name === job.currentStep);
+      if (last && last.status === 'active') { last.status = 'done'; last.completedAt = now; }
+    }
+    job.outcome = data.outcome || 'success';
+    job.prUrl = data.prUrl || null;
+    job.currentStep = null;
+    renderTimeline();
+    pruneFinishedTasks();
+  });
+
+  evtSource.addEventListener('job:error', (e) => {
+    const data = JSON.parse(e.data);
+    const job = getJob(data.ticketId);
+    const now = new Date().toISOString();
+    if (job.currentStep) {
+      const last = job.steps.find(s => s.name === job.currentStep);
+      if (last && last.status === 'active') { last.status = 'error'; last.completedAt = now; }
+    }
+    job.outcome = 'failed';
+    job.error = data.error;
+    job.currentStep = null;
+    renderTimeline();
+    pruneFinishedTasks();
+  });
+
+  evtSource.addEventListener('queue:update', (e) => {
+    const data = JSON.parse(e.data);
+    document.getElementById('queueSize').textContent = data.size || 0;
+  });
+
+  evtSource.addEventListener('approval:pending', (e) => {
+    const data = JSON.parse(e.data);
+    document.getElementById('approvalCount').textContent = parseInt(document.getElementById('approvalCount').textContent) + 1;
+    pendingApprovalSet.add(data.ticketId);
+    const job = jobs.get(data.ticketId);
+    if (job) { job.waitingApproval = true; renderTimeline(); }
+    updateApprovalsList();
+  });
+
+  evtSource.addEventListener('approval:resolved', (e) => {
+    const data = JSON.parse(e.data);
+    document.getElementById('approvalCount').textContent = Math.max(0, parseInt(document.getElementById('approvalCount').textContent) - 1);
+    pendingApprovalSet.delete(data.ticketId);
+    const job = jobs.get(data.ticketId);
+    if (job) { job.waitingApproval = false; renderTimeline(); }
+    updateApprovalsList();
+  });
+}
+
+// --- Fetch initial status ---
+async function fetchStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    const activeJobs = data.activeJobs || [];
+    document.getElementById('activeCount').textContent = activeJobs.length;
+    document.getElementById('activeLabel').textContent = activeJobs.length > 0
+      ? activeJobs.map(j => j.ticketId).join(', ') : 'Idle';
+    document.getElementById('queueSize').textContent = data.queueSize || 0;
+    document.getElementById('approvalCount').textContent = data.pendingApprovals ? data.pendingApprovals.length : 0;
+  } catch (_) {}
+}
+
+// --- Timeline rendering ---
+function renderTimeline() {
+  const container = document.getElementById('taskTimeline');
+  const emptyEl = document.getElementById('timelineEmpty');
+
+  // Update header metrics
+  const running = Array.from(jobs.values()).filter(j => !j.outcome);
+  document.getElementById('activeCount').textContent = running.length;
+  document.getElementById('activeLabel').textContent = running.length > 0
+    ? running.map(j => j.ticketId).join(', ') : 'Idle';
+
+  if (jobs.size === 0) {
+    if (emptyEl) emptyEl.style.display = '';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  // Sort: running first, then most recent finished
+  const sorted = Array.from(jobs.values()).sort((a, b) => {
+    if (!a.outcome && b.outcome) return -1;
+    if (a.outcome && !b.outcome) return 1;
+    return new Date(b.startedAt || 0) - new Date(a.startedAt || 0);
+  });
+
+  // Rebuild cards (keep existing elements by ticketId to reduce flicker)
+  const existingCards = new Map();
+  container.querySelectorAll('.task-card').forEach(el => existingCards.set(el.dataset.ticket, el));
+
+  const fragment = document.createDocumentFragment();
+  for (const job of sorted) {
+    const card = renderTaskCard(job);
+    fragment.appendChild(card);
+  }
+
+  // Clear and re-append
+  container.querySelectorAll('.task-card').forEach(el => el.remove());
+  container.appendChild(fragment);
+}
+
+function renderTaskCard(job) {
+  const card = document.createElement('div');
+  card.className = `task-card ${job.outcome || 'running'}`;
+  card.dataset.ticket = job.ticketId;
+
+  const elapsed = job.startedAt ? formatDuration(Date.now() - new Date(job.startedAt)) : '';
+  const startTime = job.startedAt ? new Date(job.startedAt).toLocaleTimeString() : '';
+
+  let outcomeHtml = '';
+  if (job.outcome === 'success') {
+    outcomeHtml = `<div class="task-outcome success">Completed${job.prUrl ? ' — <a href="' + escapeHtml(job.prUrl) + '" target="_blank">' + escapeHtml(job.prUrl) + '</a>' : ''}</div>`;
+  } else if (job.outcome === 'failed') {
+    outcomeHtml = `<div class="task-outcome failed">Failed${job.error ? ': ' + escapeHtml(job.error) : ''}</div>`;
+  } else if (job.outcome === 'cancelled') {
+    outcomeHtml = `<div class="task-outcome cancelled">Cancelled</div>`;
+  }
+
+  // Inline actions based on job state
+  let actionsHtml = '';
+  if (!job.outcome) {
+    if (job.waitingApproval) {
+      // Waiting for approval: show approve + reject
+      actionsHtml = `
+        <div class="card-actions">
+          <input class="action-input" type="text" placeholder="Instructions (optional)" id="card-instr-${job.ticketId}" />
+          <button class="action-btn primary" onclick="approveTicket('${escapeHtml(job.ticketId)}', document.getElementById('card-instr-${job.ticketId}').value)">Approve</button>
+          <button class="action-btn danger" onclick="rejectTicket('${escapeHtml(job.ticketId)}')">Reject</button>
+        </div>`;
+    } else {
+      // Running: show cancel
+      actionsHtml = `
+        <div class="card-actions">
+          <button class="action-btn danger" onclick="cancelTicket('${escapeHtml(job.ticketId)}')">Cancel</button>
+        </div>`;
+    }
+  }
+
+  card.innerHTML = `
+    <div class="task-header">
+      <div>
+        <span class="ticket-id">${escapeHtml(job.ticketId)}</span>
+        <span class="job-type">${escapeHtml((job.type || '').toUpperCase())}</span>
+      </div>
+      <div class="task-meta">${startTime}${!job.outcome ? ' — ' + elapsed : ''}</div>
+    </div>
+    <div class="timeline" id="tl-${job.ticketId}">
+      ${renderSteps(job)}
+    </div>
+    ${outcomeHtml}
+    ${actionsHtml}
+  `;
+  return card;
+}
+
+function renderSteps(job) {
+  if (job.steps.length === 0) return '<div style="color:#484f58;font-size:12px;">Starting...</div>';
+
+  return job.steps.map(step => {
+    const name = STEP_NAMES[step.name] || step.name;
+    const dur = step.completedAt && step.startedAt
+      ? formatDuration(new Date(step.completedAt) - new Date(step.startedAt))
+      : (step.status === 'active' ? formatDuration(Date.now() - new Date(step.startedAt)) : '');
+    const time = step.startedAt ? new Date(step.startedAt).toLocaleTimeString() : '';
+
+    let logsHtml = '';
+    if (step.status === 'active' && job.recentLogs.length > 0) {
+      const lines = job.recentLogs.map(l => {
+        const cls = l.level === 'warn' || l.source === 'stderr' ? 'log-warn' : '';
+        return `<div class="${cls}">${escapeHtml(l.message)}</div>`;
+      }).join('');
+      logsHtml = `<div class="tl-logs">${lines}</div>`;
+    }
+
+    let errorHtml = '';
+    if (step.status === 'error' && job.error) {
+      errorHtml = `<div class="tl-error-msg">${escapeHtml(job.error)}</div>`;
+    }
+
+    return `
+      <div class="tl-item ${step.status}">
+        <div class="tl-dot"></div>
+        <div class="tl-name">${escapeHtml(name)}${dur ? '<span class="tl-duration">' + dur + '</span>' : ''}</div>
+        <div class="tl-time">${time}</div>
+        ${logsHtml}
+        ${errorHtml}
+      </div>
+    `;
+  }).join('');
+}
+
+// Lightweight update: only re-render the logs section of the active step (avoid full re-render on every log line)
+function renderTimelineLogOnly(ticketId) {
+  const job = jobs.get(ticketId);
+  if (!job || !job.currentStep) return;
+  const tlEl = document.getElementById('tl-' + ticketId);
+  if (!tlEl) return;
+  // Find the last tl-item (active step) and update its logs
+  const items = tlEl.querySelectorAll('.tl-item');
+  const lastItem = items[items.length - 1];
+  if (!lastItem || !lastItem.classList.contains('active')) return;
+
+  let logsEl = lastItem.querySelector('.tl-logs');
+  if (!logsEl) {
+    logsEl = document.createElement('div');
+    logsEl.className = 'tl-logs';
+    lastItem.appendChild(logsEl);
+  }
+  logsEl.innerHTML = job.recentLogs.map(l => {
+    const cls = l.level === 'warn' || l.source === 'stderr' ? 'log-warn' : '';
+    return `<div class="${cls}">${escapeHtml(l.message)}</div>`;
+  }).join('');
+}
+
+function pruneFinishedTasks() {
+  const finished = Array.from(jobs.entries()).filter(([_, j]) => j.outcome);
+  if (finished.length > MAX_FINISHED_TASKS) {
+    // Remove oldest finished
+    finished.sort((a, b) => new Date(a[1].startedAt || 0) - new Date(b[1].startedAt || 0));
+    for (let i = 0; i < finished.length - MAX_FINISHED_TASKS; i++) {
+      jobs.delete(finished[i][0]);
+    }
+  }
+}
+
+// Update elapsed time for running tasks every second
+setInterval(() => {
+  const now = Date.now();
+  for (const job of jobs.values()) {
+    if (!job.outcome) {
+      const card = document.querySelector(`.task-card[data-ticket="${CSS.escape(job.ticketId)}"]`);
+      if (!card) continue;
+      // Update job-level elapsed
+      const meta = card.querySelector('.task-meta');
+      if (meta && job.startedAt) {
+        const startTime = new Date(job.startedAt).toLocaleTimeString();
+        meta.textContent = startTime + ' — ' + formatDuration(now - new Date(job.startedAt));
+      }
+      // Update active step duration
+      if (job.currentStep) {
+        const activeStep = job.steps.find(s => s.name === job.currentStep && s.status === 'active');
+        if (activeStep && activeStep.startedAt) {
+          const tlItems = card.querySelectorAll('.tl-item.active .tl-duration');
+          if (tlItems.length > 0) {
+            tlItems[tlItems.length - 1].textContent = formatDuration(now - new Date(activeStep.startedAt));
+          }
+        }
+      }
+    }
+  }
+}, 1000);
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text || '';
+  return div.innerHTML;
+}
+
+// --- History ---
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/history?limit=50');
+    const jobs = await res.json();
+    const container = document.getElementById('historyContent');
+
+    if (!jobs || jobs.length === 0) {
+      container.innerHTML = '<div class="empty-state"><div class="icon">~</div>No job history yet.</div>';
+      return;
+    }
+
+    let html = `<table class="history-table">
+      <thead><tr>
+        <th>Ticket</th><th>Type</th><th>Status</th><th>Duration</th><th>PR</th><th>Time</th>
+      </tr></thead><tbody>`;
+
+    for (const job of jobs) {
+      const statusClass = job.status === 'running' ? 'running' : (job.status === 'failed' ? 'failed' : (job.status === 'cancelled' ? 'cancelled' : 'success'));
+      const duration = job.completedAt && job.startedAt
+        ? formatDuration(new Date(job.completedAt) - new Date(job.startedAt))
+        : (job.status === 'running' ? '...' : '-');
+      const prLink = job.prUrl ? `<a href="${escapeHtml(job.prUrl)}" target="_blank">${escapeHtml(job.prUrl.split('/').pop())}</a>` : '-';
+      const time = new Date(job.startedAt).toLocaleString();
+
+      html += `<tr>
+        <td style="font-weight:600;">${escapeHtml(job.ticketId)}</td>
+        <td>${escapeHtml(job.type)}</td>
+        <td><span class="status-badge ${statusClass}">${escapeHtml(job.status)}</span></td>
+        <td>${duration}</td>
+        <td>${prLink}</td>
+        <td>${time}</td>
+      </tr>`;
+    }
+
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch (err) {
+    document.getElementById('historyContent').innerHTML =
+      `<div class="empty-state"><div class="icon">!</div>Failed to load history: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m + 'm ' + sec + 's';
+}
+
+// --- Inline card actions ---
+async function cancelTicket(ticketId) {
+  try {
+    const res = await fetch('/api/jobs/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticketId }),
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      console.error('Cancel failed:', data.error);
+    }
+  } catch (err) {
+    console.error('Cancel failed:', err.message);
+  }
+}
+
+async function triggerNewJob() {
+  const type = document.getElementById('newJobType').value;
+  const ticketId = document.getElementById('newJobTicket').value.trim();
+  const instructions = document.getElementById('newJobInstructions').value.trim();
+  const resultEl = document.getElementById('newJobResult');
+
+  if (!ticketId) { resultEl.textContent = 'Enter a ticket ID'; resultEl.style.color = '#f85149'; return; }
+
+  const body = { ticketId };
+  if (instructions) body.instructions = instructions;
+
+  try {
+    const res = await fetch(`/api/jobs/${type}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      resultEl.textContent = `Queued ${data.ticketId}`;
+      resultEl.style.color = '#3fb950';
+      document.getElementById('newJobTicket').value = '';
+      document.getElementById('newJobInstructions').value = '';
+      setTimeout(() => { resultEl.textContent = ''; }, 3000);
+    } else {
+      resultEl.textContent = data.error || 'Failed';
+      resultEl.style.color = '#f85149';
+    }
+  } catch (err) {
+    resultEl.textContent = err.message;
+    resultEl.style.color = '#f85149';
+  }
+}
+
+// --- Actions tab ---
+async function triggerJob(type) {
+  const ticketInput = document.getElementById(type + 'Ticket');
+  const resultEl = document.getElementById(type + 'Result');
+  const ticketId = ticketInput.value.trim();
+  if (!ticketId) { showActionResult(resultEl, 'error', 'Enter a ticket ID'); return; }
+
+  const body = { ticketId };
+  if (type === 'ff') {
+    const instr = document.getElementById('ffInstructions').value.trim();
+    if (instr) body.instructions = instr;
+  }
+
+  try {
+    const res = await fetch(`/api/jobs/${type}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showActionResult(resultEl, 'success', `Queued ${data.ticketId}`);
+      ticketInput.value = '';
+      // Switch to Live tab to see progress
+      switchTabDirect('live');
+    } else {
+      showActionResult(resultEl, 'error', data.error || 'Failed');
+    }
+  } catch (err) {
+    showActionResult(resultEl, 'error', err.message);
+  }
+}
+
+async function cancelJobAction() {
+  const ticketInput = document.getElementById('cancelTicket');
+  const resultEl = document.getElementById('cancelResult');
+  const ticketId = ticketInput.value.trim();
+  if (!ticketId) { showActionResult(resultEl, 'error', 'Enter a ticket ID'); return; }
+
+  try {
+    const res = await fetch('/api/jobs/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticketId }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showActionResult(resultEl, 'success', `Cancelled ${data.ticketId}`);
+      ticketInput.value = '';
+    } else {
+      showActionResult(resultEl, 'error', data.error || 'Failed');
+    }
+  } catch (err) {
+    showActionResult(resultEl, 'error', err.message);
+  }
+}
+
+async function approveTicket(ticketId, instructions) {
+  try {
+    const res = await fetch(`/api/approvals/${ticketId}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instructions }),
+    });
+    if (res.ok) updateApprovalsList();
+  } catch (_) {}
+}
+
+async function rejectTicket(ticketId) {
+  try {
+    const res = await fetch(`/api/approvals/${ticketId}/reject`, { method: 'POST' });
+    if (res.ok) updateApprovalsList();
+  } catch (_) {}
+}
+
+function showActionResult(el, type, msg) {
+  el.className = 'action-result ' + type;
+  el.textContent = msg;
+  setTimeout(() => { el.className = 'action-result'; }, 5000);
+}
+
+function switchTabDirect(name) {
+  document.querySelectorAll('.tab').forEach(t => {
+    t.classList.toggle('active', t.textContent.toLowerCase() === name);
+  });
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  if (name === 'history') loadHistory();
+}
+
+// --- Approvals list (updated via SSE events) ---
+const pendingApprovalSet = new Set();
+
+function updateApprovalsList() {
+  const container = document.getElementById('approvalsList');
+  if (pendingApprovalSet.size === 0) {
+    container.innerHTML = '<div class="empty-state" style="padding: 20px;">No pending approvals</div>';
+    return;
+  }
+  container.innerHTML = Array.from(pendingApprovalSet).map(ticketId => `
+    <div class="approval-item">
+      <div>
+        <span class="ticket">${escapeHtml(ticketId)}</span>
+        <span style="color:#8b949e;font-size:12px;margin-left:8px;">Waiting for approval</span>
+      </div>
+      <div class="approval-actions">
+        <input class="action-input" type="text" placeholder="Instructions (optional)" style="width:200px;margin:0;" id="approve-instr-${ticketId}" />
+        <button class="action-btn primary" onclick="approveTicket('${escapeHtml(ticketId)}', document.getElementById('approve-instr-${ticketId}').value)">Approve</button>
+        <button class="action-btn danger" onclick="rejectTicket('${escapeHtml(ticketId)}')">Reject</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+// --- Init ---
+fetchStatus();
+connectSSE();
+</script>
+</body>
+</html>

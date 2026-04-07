@@ -7,6 +7,7 @@ const PQueue = require("p-queue").default;
 const { spawnSync, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { agentEvents, registerStatusProvider } = require("./events");
 
 // --- Constants (from env or defaults) ---
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
@@ -18,7 +19,12 @@ const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
 const JOB_TIMEOUT_MS = 60 * 60 * 1000;
 const DEDUP_TTL_MS = 10 * 60 * 1000;
 
-const ORIGINAL_PROJECT_PATH = process.env.ORIGINAL_PROJECT_PATH || "";
+// Read original project path from target repo's port-settings.json (set by /port skill)
+const PORT_SETTINGS_PATH = path.join(REPO_ROOT, ".claude", "port-settings.json");
+const ORIGINAL_PROJECT_PATH = (() => {
+  try { return JSON.parse(fs.readFileSync(PORT_SETTINGS_PATH, "utf8")).originalProjectPath || ""; }
+  catch { return ""; }
+})();
 
 const FETCH_TICKET_PY = path.join(__dirname, "fetch_ticket.py");
 const BUILD_PROMPT_PY = path.join(__dirname, "build_prompt.py");
@@ -64,6 +70,41 @@ const pendingConfirmations = new Map(); // threadTs → { resolve }
 const ffTickets = new Set(); // ticketIds currently in ff mode → skip approve + worktree confirm in dev
 const ffTicketExtras = new Map(); // ticketId → extra instructions string
 
+// --- Status provider for web dashboard ---
+registerStatusProvider(() => {
+  const active = activeProcesses.size > 0 ? Array.from(activeProcesses.entries()).map(([id, info]) => ({
+    ticketId: id,
+    threadTs: info.threadTs,
+    channelId: info.channelId,
+  })) : [];
+  return {
+    activeJobs: active,
+    queueSize: queue.size + queue.pending,
+    pendingApprovals: Array.from(new Set([...pendingApprovals.keys(), ...ticketApprovals.keys()])),
+    ffTickets: Array.from(ffTickets),
+    uptime: process.uptime(),
+  };
+});
+
+// --- Ticket-based approval map (for web UI — parallel to threadTs-based pendingApprovals) ---
+const ticketApprovals = new Map(); // ticketId → { resolve }
+
+// --- Shim Slack client for web-triggered jobs (no-op posting) ---
+const webClient = {
+  chat: { postMessage: async () => {} },
+  reactions: { add: async () => {} },
+  conversations: { replies: async () => ({ messages: [] }) },
+};
+
+// --- Cleanup helper (centralizes state cleanup for a ticket) ---
+function cleanupTicket(ticketId) {
+  recentTickets.delete(ticketId);
+  cancelledTickets.delete(ticketId);
+  ffTickets.delete(ticketId);
+  ffTicketExtras.delete(ticketId);
+  ticketApprovals.delete(ticketId);
+}
+
 // --- Helpers ---
 async function postThread(client, channelId, threadTs, text) {
   try {
@@ -97,14 +138,40 @@ function runAsync(cmd, args, opts = {}) {
     });
     let stdout = "";
     let stderr = "";
+    let lineBuf = ""; // dual buffer for line-based event emission
     if (opts.input) proc.stdin.end(opts.input);
-    proc.stdout.on("data", (d) => { stdout += d; process.stdout.write(d); });
-    proc.stderr.on("data", (d) => { stderr += d; process.stderr.write(d); });
+    proc.stdout.on("data", (d) => {
+      stdout += d;
+      process.stdout.write(d);
+      // Line-based emission for dashboard
+      if (opts.ticketId) {
+        lineBuf += d;
+        const lines = lineBuf.split("\n");
+        lineBuf = lines.pop(); // keep incomplete last line in buffer
+        for (const line of lines) {
+          if (line.trim()) {
+            agentEvents.emit("job:log", { ticketId: opts.ticketId, source: "stdout", message: line, ts: new Date().toISOString() });
+          }
+        }
+      }
+    });
+    proc.stderr.on("data", (d) => {
+      stderr += d;
+      process.stderr.write(d);
+      if (opts.ticketId && d.toString().trim()) {
+        agentEvents.emit("job:log", { ticketId: opts.ticketId, source: "stderr", message: d.toString().trim(), level: "warn", ts: new Date().toISOString() });
+      }
+    });
     proc.on("error", (err) => {
       if (opts.ticketId) activeProcesses.delete(opts.ticketId);
       reject(err);
     });
     proc.on("close", (code) => {
+      // Flush remaining line buffer
+      if (opts.ticketId && lineBuf.trim()) {
+        agentEvents.emit("job:log", { ticketId: opts.ticketId, source: "stdout", message: lineBuf.trim(), ts: new Date().toISOString() });
+        lineBuf = "";
+      }
       if (opts.ticketId) activeProcesses.delete(opts.ticketId);
       if (code !== 0) {
         reject(new Error(`Command failed (exit ${code}): ${cmd} ${args.join(" ")}\n${(stderr || stdout).trim()}`));
@@ -268,7 +335,7 @@ IMPORTANT:
 
   const output = await runAsync(
     CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-explore`],
-    { input: explorePrompt, cwd: ORIGINAL_PROJECT_PATH, env: { ...process.env }, timeout: CLAUDE_TIMEOUT_MS, ticketId: `${ticketId}:explore` }
+    { input: explorePrompt, cwd: ORIGINAL_PROJECT_PATH, env: { ...process.env }, timeout: CLAUDE_TIMEOUT_MS, ticketId }
   );
 
   const cleaned = cleanAgentOutput(output.trim());
@@ -285,70 +352,55 @@ IMPORTANT:
   return cleaned;
 }
 
-// --- Port: Upsert Linear comment with HTML markers (same format as flutter /port skill) ---
-const LINEAR_API_KEY = process.env.LINEAR_API_KEY;
-const PORT_COMMENT_ID_FILE = "port-linear-comment-id.txt";
+// --- Port: Post artifacts to Linear via Claude CLI (delegates to target repo's MCP tools) ---
+async function postPortArtifactsToLinear(ticketId, worktreePath) {
+  const changesDir = path.join(worktreePath, "openspec", "changes");
+  const saPath = path.join(changesDir, "port-source-analysis.md");
+  const ticketPath = `/tmp/ticket-${ticketId}.json`;
+  if (!fs.existsSync(ticketPath)) {
+    console.error(`[${ticketId}] Ticket JSON not found, skipping Linear post`);
+    return;
+  }
+  const ticket = JSON.parse(fs.readFileSync(ticketPath, "utf8"));
+  const titleSlug = slugify(ticket.title);
+  const artifactDir = path.join(changesDir, titleSlug);
+  const prdPath = path.join(artifactDir, "prd.md");
+  const designPath = path.join(artifactDir, "design-guidance.md");
 
-async function getLinearIssueUuid(ticketId) {
-  const query = `query { issueSearch(filter: { identifier: { eq: "${ticketId}" } }) { nodes { id } } }`;
-  const res = await fetch("https://api.linear.app/graphql", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: LINEAR_API_KEY },
-    body: JSON.stringify({ query }),
-  });
-  const data = await res.json();
-  return data?.data?.issueSearch?.nodes?.[0]?.id || null;
-}
+  // Collect artifact contents
+  const sa = fs.existsSync(saPath) ? fs.readFileSync(saPath, "utf8").trim() : "";
+  const prd = fs.existsSync(prdPath) ? fs.readFileSync(prdPath, "utf8").trim() : "";
+  const design = fs.existsSync(designPath) ? fs.readFileSync(designPath, "utf8").trim() : null;
 
-function composePortCommentBody(artifacts) {
-  let body = `## Port Source Analysis\n<!-- PORT:SOURCE_ANALYSIS:START -->\n${artifacts.sourceAnalysis}\n<!-- PORT:SOURCE_ANALYSIS:END -->\n\n---\n\n`;
-  body += `## Port PRD\n<!-- PORT:PRD:START -->\n${artifacts.prd}\n<!-- PORT:PRD:END -->\n`;
-  if (artifacts.design) {
-    body += `\n---\n\n## Port Design Changed\n<!-- PORT:DESIGN_CHANGED:START -->\n${artifacts.design}\n<!-- PORT:DESIGN_CHANGED:END -->\n`;
+  if (!sa && !prd) {
+    console.log(`[${ticketId}] No artifacts to post to Linear`);
+    return;
+  }
+
+  // Compose the comment body (same HTML marker format the target repo's port-feature skill expects)
+  let body = `## Port Source Analysis\n<!-- PORT:SOURCE_ANALYSIS:START -->\n${sa}\n<!-- PORT:SOURCE_ANALYSIS:END -->\n\n---\n\n`;
+  body += `## Port PRD\n<!-- PORT:PRD:START -->\n${prd}\n<!-- PORT:PRD:END -->\n`;
+  if (design) {
+    body += `\n---\n\n## Port Design Changed\n<!-- PORT:DESIGN_CHANGED:START -->\n${design}\n<!-- PORT:DESIGN_CHANGED:END -->\n`;
   }
   const now = new Date().toISOString().slice(0, 16).replace("T", " ");
   body += `\n---\n\n_Posted: ${now} by Slack PM Agent_`;
-  return body;
-}
 
-async function upsertPortComment(ticketId, worktreePath, artifacts) {
-  const commentIdPath = path.join(worktreePath, PORT_COMMENT_ID_FILE);
-  const existingCommentId = fs.existsSync(commentIdPath) ? fs.readFileSync(commentIdPath, "utf8").trim() : null;
-  const body = composePortCommentBody(artifacts);
+  const prompt = `Post the following as a comment on Linear ticket ${ticketId} (identifier: "${ticketId}").
+Use the Linear MCP tool (save_comment or equivalent) to create or update the comment.
+Do NOT modify the content — post it exactly as provided.
 
-  if (existingCommentId) {
-    const mutation = `mutation { commentUpdate(id: "${existingCommentId}", input: { body: ${JSON.stringify(body)} }) { success } }`;
-    const res = await fetch("https://api.linear.app/graphql", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: LINEAR_API_KEY },
-      body: JSON.stringify({ query: mutation }),
-    });
-    const data = await res.json();
-    if (data?.data?.commentUpdate?.success) {
-      console.log(`[${ticketId}] Port comment updated on Linear`);
-    } else {
-      console.error(`[${ticketId}] Failed to update Linear comment:`, JSON.stringify(data));
-    }
-  } else {
-    const issueUuid = await getLinearIssueUuid(ticketId);
-    if (!issueUuid) {
-      console.error(`[${ticketId}] Could not find Linear issue UUID`);
-      return;
-    }
-    const mutation = `mutation { commentCreate(input: { issueId: "${issueUuid}", body: ${JSON.stringify(body)} }) { success comment { id } } }`;
-    const res = await fetch("https://api.linear.app/graphql", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: LINEAR_API_KEY },
-      body: JSON.stringify({ query: mutation }),
-    });
-    const data = await res.json();
-    if (data?.data?.commentCreate?.success) {
-      const commentId = data.data.commentCreate.comment.id;
-      fs.writeFileSync(commentIdPath, commentId, "utf8");
-      console.log(`[${ticketId}] Port comment created on Linear (id: ${commentId})`);
-    } else {
-      console.error(`[${ticketId}] Failed to create Linear comment:`, JSON.stringify(data));
-    }
+---
+${body}`;
+
+  try {
+    await runAsync(
+      CLAUDE_BIN, ["--print", "--dangerously-skip-permissions", "--name", `${ticketId}-linear-post`],
+      { input: prompt, cwd: worktreePath, env: { ...process.env }, timeout: 5 * 60 * 1000, ticketId }
+    );
+    console.log(`[${ticketId}] Port artifacts posted to Linear via Claude CLI`);
+  } catch (err) {
+    console.error(`[${ticketId}] Failed to post to Linear via Claude CLI:`, err.message);
   }
 }
 
@@ -497,13 +549,22 @@ function isRecentlyQueued(ticketId) {
   return true;
 }
 
-function waitForApproval(threadTs, timeoutMs = 60 * 60 * 1000) {
+function waitForApproval(threadTs, timeoutMs = 60 * 60 * 1000, ticketId = null) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingApprovals.delete(threadTs);
+      if (ticketId) ticketApprovals.delete(ticketId);
       resolve({ approved: false, extra: "" });
     }, timeoutMs);
-    pendingApprovals.set(threadTs, { resolve: (val) => { clearTimeout(timer); resolve(val); } });
+    const resolver = (val) => {
+      clearTimeout(timer);
+      pendingApprovals.delete(threadTs);
+      if (ticketId) ticketApprovals.delete(ticketId);
+      resolve(val);
+    };
+    pendingApprovals.set(threadTs, { resolve: resolver });
+    // Also register by ticketId so web UI can resolve
+    if (ticketId) ticketApprovals.set(ticketId, { resolve: resolver });
   });
 }
 
@@ -596,6 +657,15 @@ function ensureWorktree(ticketId) {
     run("git", ["worktree", "add", "-b", branch, worktreePath, "origin/trunk"], { cwd: REPO_ROOT });
   }
 
+  // Copy .claude/settings.local.json from main repo (permissions don't travel with git)
+  const srcSettings = path.join(REPO_ROOT, ".claude", "settings.local.json");
+  const dstDir = path.join(worktreePath, ".claude");
+  const dstSettings = path.join(dstDir, "settings.local.json");
+  if (fs.existsSync(srcSettings) && !fs.existsSync(dstSettings)) {
+    fs.mkdirSync(dstDir, { recursive: true });
+    fs.copyFileSync(srcSettings, dstSettings);
+  }
+
   return { worktreePath, branch, created: true };
 }
 
@@ -667,15 +737,20 @@ pmApp.event("app_mention", async ({ event, client }) => {
     await postThread(client, channelId, threadTs, `Generating PRD + OpenSpec artifacts for \`${ticketId}\`...`);
 
     queue.add(async () => {
+      agentEvents.emit("job:start", { ticketId, type: "prd", user: requesterId, ts: new Date().toISOString() });
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
       let worktreePath, branch;
       try {
         // Fetch ticket
+        agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
         run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
 
         // Create or reuse worktree with feature branch (asks user if exists)
+        agentEvents.emit("job:step", { ticketId, step: "worktree" });
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
         // Check if artifacts already exist (must have proposal.md to be considered complete)
+        agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
         const changesDir = path.join(worktreePath, "openspec", "changes");
         const { hasArtifacts, dirs: existingArtifacts } = checkArtifacts(changesDir);
 
@@ -685,10 +760,12 @@ pmApp.event("app_mention", async ({ event, client }) => {
           );
         } else {
           if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+          agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
           await postThread(client, channelId, threadTs, `PM + Designer agents working on \`${branch}\`...`);
           await runPMPhase(ticketId, worktreePath, channelId, threadTs);
 
           // Ensure artifacts are committed and pushed (safety net)
+          agentEvents.emit("job:step", { ticketId, step: "push-artifacts" });
           spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
           spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
           run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
@@ -696,6 +773,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
 
         // Post artifact contents to Slack (both skip and generate paths)
         await postArtifactsToSlack(changesDir, client, channelId, threadTs);
+        agentEvents.emit("job:complete", { ticketId, outcome: "success" });
 
         // Mention requester
         await postThread(client, channelId, threadTs,
@@ -719,9 +797,11 @@ pmApp.event("app_mention", async ({ event, client }) => {
           return;
         }
         console.error(`[PRD ${ticketId}] failed:`, err.message);
+        agentEvents.emit("job:error", { ticketId, error: err.message });
         await postThread(client, channelId, threadTs, `PRD generation failed: ${err.message}`);
       } finally {
         cancelledTickets.delete(ticketId);
+        agentEvents.emit("queue:update", { size: queue.size + queue.pending });
       }
     });
 
@@ -732,15 +812,20 @@ pmApp.event("app_mention", async ({ event, client }) => {
     await postThread(client, channelId, threadTs, `FF mode: generating artifacts for \`${ticketId}\` then handing off to Dev...`);
 
     queue.add(async () => {
+      agentEvents.emit("job:start", { ticketId, type: "ff", user: requesterId, ts: new Date().toISOString() });
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
       let worktreePath, branch;
       try {
         // Fetch ticket
+        agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
         run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
 
         // Create or reuse worktree with feature branch (asks user if exists)
+        agentEvents.emit("job:step", { ticketId, step: "worktree" });
         ({ worktreePath, branch } = await ensureWorktreeInteractive(ticketId, channelId, threadTs, client));
 
         // Check if artifacts already exist (must have proposal.md to be considered complete)
+        agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
         const changesDir = path.join(worktreePath, "openspec", "changes");
         const { hasArtifacts, dirs: existingArtifacts } = checkArtifacts(changesDir);
 
@@ -751,6 +836,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
         } else {
           // Run PM + Designer agents
           if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+          agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
           await postThread(client, channelId, threadTs, `PM + Designer agents working on \`${branch}\`...`);
           await runPMPhase(ticketId, worktreePath, channelId, threadTs);
 
@@ -782,6 +868,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
         console.error(`[FF ${ticketId}] failed:`, err.message);
         ffTickets.delete(ticketId);
         ffTicketExtras.delete(ticketId);
+        agentEvents.emit("job:error", { ticketId, error: err.message });
         await postThread(client, channelId, threadTs, `FF mode failed (PM phase): ${err.message}`);
       } finally {
         cancelledTickets.delete(ticketId);
@@ -794,7 +881,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
     const extraInstructions = isPortFF && portffMatch[2] ? portffMatch[2].trim() : null;
 
     if (!ORIGINAL_PROJECT_PATH) {
-      await postThread(client, channelId, threadTs, "`ORIGINAL_PROJECT_PATH` not set in .env — required for port commands.");
+      await postThread(client, channelId, threadTs, "`originalProjectPath` not found in `REPO_ROOT/.claude/port-settings.json` — run `/port` in the target repo first.");
       return;
     }
 
@@ -862,19 +949,8 @@ pmApp.event("app_mention", async ({ event, client }) => {
           }
         }
 
-        // Upsert Linear comment with HTML markers
-        const ticketPath = `/tmp/ticket-${ticketId}.json`;
-        const ticket = JSON.parse(fs.readFileSync(ticketPath, "utf8"));
-        const titleSlug = slugify(ticket.title);
-        const artifactDir = path.join(changesDir2, titleSlug);
-        const prdPath = path.join(artifactDir, "prd.md");
-        const designPath = path.join(artifactDir, "design-guidance.md");
-
-        await upsertPortComment(ticketId, worktreePath, {
-          sourceAnalysis: fs.existsSync(saPath) ? fs.readFileSync(saPath, "utf8").trim() : "",
-          prd: fs.existsSync(prdPath) ? fs.readFileSync(prdPath, "utf8").trim() : "",
-          design: fs.existsSync(designPath) ? fs.readFileSync(designPath, "utf8").trim() : null,
-        });
+        // Post artifacts to Linear via Claude CLI (uses target repo's MCP tools)
+        await postPortArtifactsToLinear(ticketId, worktreePath);
 
         if (isPortFF) {
           // Hand off to Dev
@@ -963,17 +1039,7 @@ pmApp.event("app_mention", async ({ event, client }) => {
         // If this is a port ticket, sync updated artifacts to Linear
         const saPath = path.join(workDir, "openspec", "changes", "port-source-analysis.md");
         if (fs.existsSync(saPath)) {
-          const changeDirsForPort = fs.readdirSync(changesDir)
-            .filter(d => d !== "archive" && d !== ".gitkeep" && fs.statSync(path.join(changesDir, d)).isDirectory());
-          for (const dir of changeDirsForPort) {
-            const prdPath = path.join(changesDir, dir, "prd.md");
-            const designPath = path.join(changesDir, dir, "design-guidance.md");
-            await upsertPortComment(ticketId, workDir, {
-              sourceAnalysis: fs.readFileSync(saPath, "utf8").trim(),
-              prd: fs.existsSync(prdPath) ? fs.readFileSync(prdPath, "utf8").trim() : "",
-              design: fs.existsSync(designPath) ? fs.readFileSync(designPath, "utf8").trim() : null,
-            });
-          }
+          await postPortArtifactsToLinear(ticketId, workDir);
           await postThread(client, channelId, threadTs, "Updated artifacts also synced to Linear.");
         }
 
@@ -1102,10 +1168,13 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
   const jobTimer = setTimeout(() => { jobTimedOut = true; }, JOB_TIMEOUT_MS);
 
   let worktreePath, branch;
+  agentEvents.emit("job:start", { ticketId, type: opts.isFF ? "ff-dev" : "dev", user: "slack", ts: new Date().toISOString() });
+  agentEvents.emit("queue:update", { size: queue.size + queue.pending });
 
   try {
     // Step 1: Fetch ticket + Linear update (skip fetch if FF already has it)
     if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+    agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
     const ticketCachePath = `/tmp/ticket-${ticketId}.json`;
     if (opts.isFF && fs.existsSync(ticketCachePath)) {
       await postThread(client, channelId, threadTs, `Ticket \`${ticketId}\` already fetched, updating Linear...`);
@@ -1119,6 +1188,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     if (jobTimedOut) throw new Error("Job timed out");
 
     // Step 2: Create or reuse worktree with feature branch
+    agentEvents.emit("job:step", { ticketId, step: "worktree" });
     await postThread(client, channelId, threadTs, `Preparing workspace...`);
     if (opts.isFF || opts.isFromThread) {
       // FF mode or thread trigger: worktree already exists, skip interactive confirmation
@@ -1130,6 +1200,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     if (jobTimedOut) throw new Error("Job timed out");
 
     // Step 3: Check if openspec artifacts already exist (must have proposal.md)
+    agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
     const changesDir = path.join(worktreePath, "openspec", "changes");
     const { hasArtifacts, dirs: existing } = checkArtifacts(changesDir);
 
@@ -1167,6 +1238,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
       }
     }
 
+    agentEvents.emit("approval:pending", { ticketId });
     let approved, extra;
     if (opts.isFF) {
       // FF mode: auto-approve, no user interaction needed
@@ -1178,8 +1250,10 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
         extra = ffExtra;
         ffTicketExtras.delete(ticketId);
       }
+      agentEvents.emit("approval:resolved", { ticketId, decision: "auto-approved" });
     } else {
-      ({ approved, extra } = await waitForApproval(threadTs));
+      ({ approved, extra } = await waitForApproval(threadTs, undefined, ticketId));
+      agentEvents.emit("approval:resolved", { ticketId, decision: approved ? "approved" : "rejected" });
       if (!approved) {
         await postThread(client, channelId, threadTs, `Cancelled \`${ticketId}\`.`);
         return;
@@ -1251,6 +1325,7 @@ async function runDevJob(ticketId, channelId, threadTs, client, threadContext, o
     }
 
     // Step 4b: dev-agent (opsx:apply + verify + test)
+    agentEvents.emit("job:step", { ticketId, step: "dev-agent" });
     const { dirs: artifactDirs } = checkArtifacts(changesDir);
     const artifactSlug = artifactDirs[0] || "";
     const devContext = buildTicketContext(ticketId, worktreePath, applyExtra);
@@ -1272,16 +1347,19 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
     // Step 5: /commit
+    agentEvents.emit("job:step", { ticketId, step: "commit" });
     await runSkill("commit", `/commit\n\nDo not ask for confirmation. Commit all changes automatically.\nIMPORTANT: You are working in a git worktree at ${worktreePath} on branch ${branch}. All git commands must run inside this directory. Do NOT commit to any other branch or directory.`);
     safetyCommit(worktreePath, ticketId, "after /commit");
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
     // Step 6: /format
+    agentEvents.emit("job:step", { ticketId, step: "format" });
     await runSkill("format", `/format\n\nDo not ask for confirmation. Format and commit automatically.\nIMPORTANT: You are working in a git worktree at ${worktreePath} on branch ${branch}. All git commands must run inside this directory.`);
     safetyCommit(worktreePath, ticketId, "after /format");
     run("git", ["push", "origin", "HEAD", "--force-with-lease"], { cwd: worktreePath });
 
     // Step 7: archive openspec, commit any remaining changes, push + create PR
+    agentEvents.emit("job:step", { ticketId, step: "push-pr" });
     await postThread(client, channelId, threadTs, `Pushing and creating PR...`);
     const changesDir2 = path.join(worktreePath, "openspec", "changes");
     const archiveDir = path.join(changesDir2, "archive");
@@ -1309,6 +1387,7 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     if (fs.existsSync(prUrlFile)) { prUrl = fs.readFileSync(prUrlFile, "utf8").trim(); }
 
     // Step 8: /code-review
+    agentEvents.emit("job:step", { ticketId, step: "code-review" });
     const reviewOut = await runSkill("code-review", `/code-review\n\nAfter generating the review, automatically post it as a comment on the PR. Do not ask for confirmation.\nIMPORTANT: You are working in a git worktree at ${worktreePath} on branch ${branch}.`);
     const reviewTruncated = reviewOut.trim().slice(-2000) || "(no output)";
     await postThread(client, channelId, threadTs, `Code review:\n\`\`\`\n${reviewTruncated}\n\`\`\``);
@@ -1316,6 +1395,7 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     const successMsg = prUrl
       ? `All done! PR ready: ${prUrl}`
       : `All done! \`${ticketId}\` implementation complete.`;
+    agentEvents.emit("job:complete", { ticketId, outcome: "success", prUrl });
     await postThread(client, channelId, threadTs, successMsg);
 
     const sessionId = getLatestSessionId();
@@ -1327,8 +1407,10 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
   } catch (err) {
     if (cancelledTickets.has(ticketId)) {
       console.log(`[${ticketId}] Job cancelled.`);
+      agentEvents.emit("job:complete", { ticketId, outcome: "cancelled" });
       return;
     }
+    agentEvents.emit("job:error", { ticketId, error: err.message });
     // Safety commit on failure — preserve any partial implementation
     if (worktreePath && fs.existsSync(worktreePath)) {
       safetyCommit(worktreePath, ticketId, "on failure");
@@ -1349,14 +1431,267 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
     }
   } finally {
     clearTimeout(jobTimer);
-    recentTickets.delete(ticketId);
-    cancelledTickets.delete(ticketId);
-    ffTickets.delete(ticketId);
-    ffTicketExtras.delete(ticketId);
+    cleanupTicket(ticketId);
   }
 }
 
-// --- Start both bots ---
+// --- Web API: exported functions for web.js to trigger jobs ---
+function triggerFF(ticketId, instructions) {
+  if (isRecentlyQueued(ticketId)) return { ok: false, error: "Already queued" };
+  recentTickets.set(ticketId, Date.now());
+  ffTickets.add(ticketId);
+  if (instructions) ffTicketExtras.set(ticketId, instructions);
+
+  queue.add(async () => {
+    agentEvents.emit("job:start", { ticketId, type: "ff", user: "web", ts: new Date().toISOString() });
+    agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    let worktreePath, branch;
+    try {
+      agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
+      run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+      agentEvents.emit("job:step", { ticketId, step: "worktree" });
+      ({ worktreePath, branch } = ensureWorktree(ticketId));
+
+      agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
+      const changesDir = path.join(worktreePath, "openspec", "changes");
+      const { hasArtifacts } = checkArtifacts(changesDir);
+
+      if (!hasArtifacts) {
+        if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+        agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
+        await runPMPhase(ticketId, worktreePath, null, null);
+        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+      }
+
+      // Hand off to dev (inline, not via Slack mention)
+      await runDevJob(ticketId, null, ticketId, webClient, "", { isFF: true, isFromThread: false });
+    } catch (err) {
+      if (!cancelledTickets.has(ticketId)) {
+        agentEvents.emit("job:error", { ticketId, error: err.message });
+      }
+      ffTickets.delete(ticketId);
+      ffTicketExtras.delete(ticketId);
+    } finally {
+      cancelledTickets.delete(ticketId);
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    }
+  });
+  return { ok: true };
+}
+
+function triggerDev(ticketId) {
+  if (isRecentlyQueued(ticketId)) return { ok: false, error: "Already queued" };
+  recentTickets.set(ticketId, Date.now());
+  queue.add(() => runDevJob(ticketId, null, ticketId, webClient, "", { isFF: false, isFromThread: false }));
+  return { ok: true };
+}
+
+function triggerPRD(ticketId) {
+  if (isRecentlyQueued(ticketId)) return { ok: false, error: "Already queued" };
+  recentTickets.set(ticketId, Date.now());
+
+  queue.add(async () => {
+    agentEvents.emit("job:start", { ticketId, type: "prd", user: "web", ts: new Date().toISOString() });
+    agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    let worktreePath, branch;
+    try {
+      agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
+      run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+      agentEvents.emit("job:step", { ticketId, step: "worktree" });
+      ({ worktreePath, branch } = ensureWorktree(ticketId));
+
+      agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
+      const changesDir = path.join(worktreePath, "openspec", "changes");
+      const { hasArtifacts } = checkArtifacts(changesDir);
+
+      if (hasArtifacts) {
+        agentEvents.emit("job:log", { ticketId, source: "system", message: "Artifacts already exist, skipping generation." });
+      } else {
+        if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+        agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
+        await runPMPhase(ticketId, worktreePath, null, null);
+        agentEvents.emit("job:step", { ticketId, step: "push-artifacts" });
+        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: add openspec artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+      }
+      agentEvents.emit("job:complete", { ticketId, outcome: "success" });
+    } catch (err) {
+      if (!cancelledTickets.has(ticketId)) {
+        agentEvents.emit("job:error", { ticketId, error: err.message });
+      }
+    } finally {
+      cancelledTickets.delete(ticketId);
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    }
+  });
+  return { ok: true };
+}
+
+function triggerPort(ticketId) {
+  if (isRecentlyQueued(ticketId)) return { ok: false, error: "Already queued" };
+  if (!ORIGINAL_PROJECT_PATH) return { ok: false, error: "originalProjectPath not found in REPO_ROOT/.claude/port-settings.json" };
+  recentTickets.set(ticketId, Date.now());
+
+  queue.add(async () => {
+    agentEvents.emit("job:start", { ticketId, type: "port", user: "web", ts: new Date().toISOString() });
+    agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    let worktreePath, branch;
+    try {
+      agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
+      run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+      agentEvents.emit("job:step", { ticketId, step: "worktree" });
+      ({ worktreePath, branch } = ensureWorktree(ticketId));
+
+      agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
+      const changesDir = path.join(worktreePath, "openspec", "changes");
+      const { hasArtifacts } = checkArtifacts(changesDir);
+
+      if (!hasArtifacts) {
+        if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+
+        // Step 1: Explore original project
+        agentEvents.emit("job:step", { ticketId, step: "explore" });
+        const saCache = path.join(changesDir, "port-source-analysis.md");
+        let sourceAnalysis;
+        if (fs.existsSync(saCache) && fs.readFileSync(saCache, "utf8").trim().length >= 50) {
+          sourceAnalysis = fs.readFileSync(saCache, "utf8").trim();
+        } else {
+          sourceAnalysis = await runExplore(ticketId, worktreePath);
+          safetyCommit(worktreePath, ticketId, "post-explore");
+        }
+
+        if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+
+        // Step 2: PM + Designer + /opsx:ff (with source analysis)
+        agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
+        await runPMPhase(ticketId, worktreePath, null, null, { sourceAnalysis });
+        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: add port artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+      }
+
+      // Post artifacts to Linear via Claude CLI
+      await postPortArtifactsToLinear(ticketId, worktreePath);
+
+      agentEvents.emit("job:complete", { ticketId, outcome: "success" });
+    } catch (err) {
+      if (!cancelledTickets.has(ticketId)) {
+        agentEvents.emit("job:error", { ticketId, error: err.message });
+      }
+    } finally {
+      cancelledTickets.delete(ticketId);
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    }
+  });
+  return { ok: true };
+}
+
+function triggerPortFF(ticketId, instructions) {
+  if (isRecentlyQueued(ticketId)) return { ok: false, error: "Already queued" };
+  if (!ORIGINAL_PROJECT_PATH) return { ok: false, error: "originalProjectPath not found in REPO_ROOT/.claude/port-settings.json" };
+  recentTickets.set(ticketId, Date.now());
+  ffTickets.add(ticketId);
+  if (instructions) ffTicketExtras.set(ticketId, instructions);
+
+  queue.add(async () => {
+    agentEvents.emit("job:start", { ticketId, type: "portff", user: "web", ts: new Date().toISOString() });
+    agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    let worktreePath, branch;
+    try {
+      agentEvents.emit("job:step", { ticketId, step: "fetch-ticket" });
+      run("python3", [FETCH_TICKET_PY, ticketId], { env: { ...process.env } });
+      agentEvents.emit("job:step", { ticketId, step: "worktree" });
+      ({ worktreePath, branch } = ensureWorktree(ticketId));
+
+      agentEvents.emit("job:step", { ticketId, step: "check-artifacts" });
+      const changesDir = path.join(worktreePath, "openspec", "changes");
+      const { hasArtifacts } = checkArtifacts(changesDir);
+
+      if (!hasArtifacts) {
+        if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+
+        // Step 1: Explore original project
+        agentEvents.emit("job:step", { ticketId, step: "explore" });
+        const saCache = path.join(changesDir, "port-source-analysis.md");
+        let sourceAnalysis;
+        if (fs.existsSync(saCache) && fs.readFileSync(saCache, "utf8").trim().length >= 50) {
+          sourceAnalysis = fs.readFileSync(saCache, "utf8").trim();
+        } else {
+          sourceAnalysis = await runExplore(ticketId, worktreePath);
+          safetyCommit(worktreePath, ticketId, "post-explore");
+        }
+
+        if (cancelledTickets.has(ticketId)) throw new Error("Cancelled");
+
+        // Step 2: PM + Designer + /opsx:ff (with source analysis)
+        agentEvents.emit("job:step", { ticketId, step: "pm-agent" });
+        await runPMPhase(ticketId, worktreePath, null, null, { sourceAnalysis });
+        spawnSync("git", ["add", "-A"], { cwd: worktreePath, encoding: "utf8" });
+        spawnSync("git", ["commit", "-m", `chore: add port artifacts for ${ticketId}`], { cwd: worktreePath, encoding: "utf8" });
+        run("git", ["push", "-u", "origin", branch], { cwd: worktreePath });
+      }
+
+      // Post artifacts to Linear via Claude CLI
+      await postPortArtifactsToLinear(ticketId, worktreePath);
+
+      // Hand off to dev
+      await runDevJob(ticketId, null, ticketId, webClient, "", { isFF: true, isFromThread: false });
+    } catch (err) {
+      if (!cancelledTickets.has(ticketId)) {
+        agentEvents.emit("job:error", { ticketId, error: err.message });
+      }
+      ffTickets.delete(ticketId);
+      ffTicketExtras.delete(ticketId);
+    } finally {
+      cancelledTickets.delete(ticketId);
+      agentEvents.emit("queue:update", { size: queue.size + queue.pending });
+    }
+  });
+  return { ok: true };
+}
+
+function cancelJob(ticketId) {
+  const active = activeProcesses.get(ticketId);
+  if (!active) return { ok: false, error: "No running job found" };
+  active.proc.kill("SIGTERM");
+  cancelledTickets.add(ticketId);
+  activeProcesses.delete(ticketId);
+  recentTickets.delete(ticketId);
+  const approvalThreadTs = active.threadTs;
+  if (approvalThreadTs) pendingApprovals.delete(approvalThreadTs);
+  ticketApprovals.delete(ticketId);
+
+  const worktreePath = path.join(WORKTREE_BASE, ticketId);
+  const branch = `feat/${ticketId}`;
+  if (fs.existsSync(worktreePath)) {
+    spawnSync("git", ["worktree", "remove", "--force", worktreePath], { cwd: REPO_ROOT, encoding: "utf8" });
+  }
+  spawnSync("git", ["branch", "-D", branch], { cwd: REPO_ROOT, encoding: "utf8" });
+  agentEvents.emit("job:complete", { ticketId, outcome: "cancelled" });
+  return { ok: true };
+}
+
+function resolveApproval(ticketId, decision, instructions) {
+  const pending = ticketApprovals.get(ticketId);
+  if (!pending) return { ok: false, error: "No pending approval for this ticket" };
+  pending.resolve({ approved: decision === "approve", extra: instructions || "" });
+  return { ok: true };
+}
+
+module.exports = { triggerFF, triggerDev, triggerPRD, triggerPort, triggerPortFF, cancelJob, resolveApproval, ticketApprovals };
+
+// --- Uncaught error handlers (prevent dashboard crashes from killing agent) ---
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT]", err.message);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("[UNHANDLED]", err && err.message ? err.message : err);
+});
+
+// --- Start both bots + web dashboard ---
 (async () => {
   const [pmAuth, devAuth] = await Promise.all([
     pmApp.client.auth.test(),
@@ -1367,4 +1702,12 @@ You have FULL write permissions to ALL directories including \`openspec/\`, \`li
 
   await Promise.all([pmApp.start(), devApp.start()]);
   console.log("PM agent + Dev agent running (Socket Mode)");
+
+  // Start web dashboard
+  try {
+    require("./web");
+  } catch (err) {
+    console.error("[web] Dashboard failed to start:", err.message);
+    console.error("[web] Agent continues without dashboard.");
+  }
 })();
